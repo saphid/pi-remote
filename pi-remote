@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.5.0"
+VERSION="0.6.0"
 # Literal remote-shell expression; expanded on LXS01, not on the Mac.
 # shellcheck disable=SC2016
 REMOTE_PROJECT_PATH='"$HOME/projects/pi-remote/pi-remote"'
@@ -157,6 +157,12 @@ tmux_config_file() {
   printf '%s\n' "${PI_REMOTE_TMUX_CONFIG:-$HOME/.tmux.conf}"
 }
 
+tmux_config_has_managed_block() {
+  local file=$1
+  [[ -r "$file" ]] || return 1
+  grep -Eq '^# BEGIN pi-remote tmux (enhancements|defaults)$' "$file"
+}
+
 tmux_config_has_features() {
   local file=$1
   [[ -r "$file" ]] || return 1
@@ -167,23 +173,17 @@ tmux_config_has_features() {
 
 render_tmux_config_block() {
   cat <<'EOF'
-# BEGIN pi-remote tmux defaults
-# Managed by pi-remote. Adds remote-agent-friendly key handling and a help hint.
-set -g mouse on
+# BEGIN pi-remote tmux enhancements
+# Managed by pi-remote. This block is appended/updated without changing the rest of your tmux config.
+# It enables modern modified-key passthrough for agent TUIs and advertises tmux's help screen.
 set -s extended-keys on
 set -g xterm-keys on
 set -g terminal-features[90] 'xterm*:extkeys'
 set -g terminal-features[91] 'screen*:extkeys'
 set -g terminal-features[92] 'tmux*:extkeys'
 set -g status on
-set -g status-position bottom
-set -g status-style bg=green,fg=black
-set -g status-left '[#S] #I:#W '
-set -g status-left-length 40
-set -g status-right '%H:%M %d-%b-%y'
-set -g status-right-length 30
-set -g status-format[0] '#[align=left][#S] #I:#W #[align=centre,bold]Help: Prefix ?#[default]#[align=right]%H:%M %d-%b-%y'
-# END pi-remote tmux defaults
+set -g status-format[0] '#[align=left]#{E:status-left}#[align=centre,bold]Help: Prefix ?#[default]#[align=right]#{E:status-right}'
+# END pi-remote tmux enhancements
 EOF
 }
 
@@ -203,18 +203,23 @@ apply_remote_tmux_config() {
     : >"$file"
   fi
 
-  if grep -q '^# BEGIN pi-remote tmux defaults$' "$file"; then
+  if tmux_config_has_managed_block "$file"; then
     awk -v block="$block_file" '
-      $0 == "# BEGIN pi-remote tmux defaults" {
+      $0 == "# BEGIN pi-remote tmux enhancements" || $0 == "# BEGIN pi-remote tmux defaults" {
         while ((getline line < block) > 0) print line
         in_block = 1
         next
       }
-      $0 == "# END pi-remote tmux defaults" { in_block = 0; next }
+      $0 == "# END pi-remote tmux enhancements" || $0 == "# END pi-remote tmux defaults" { in_block = 0; next }
       !in_block { print }
     ' "$file" >"$tmp"
   else
-    { cat "$file"; printf '\n'; cat "$block_file"; } >"$tmp"
+    cat "$file" >"$tmp"
+    if [[ -s "$tmp" ]] && [[ $(tail -c 1 "$tmp" | wc -l) -eq 0 ]]; then
+      printf '\n' >>"$tmp"
+    fi
+    printf '\n' >>"$tmp"
+    cat "$block_file" >>"$tmp"
   fi
 
   install -m 0644 "$tmp" "$file"
@@ -234,7 +239,7 @@ apply_remote_tmux_config() {
   rm -f /tmp/pi-remote-tmux-config-error.$$
 
   tmux source-file "$file" >/dev/null 2>&1 || true
-  printf 'Updated remote tmux config: %s\n' "$file" >/dev/tty 2>/dev/null || printf 'Updated remote tmux config: %s\n' "$file"
+  printf 'Enhanced remote tmux config: %s\n' "$file" >/dev/tty 2>/dev/null || printf 'Enhanced remote tmux config: %s\n' "$file"
   if [[ -n "$backup" ]]; then
     printf 'Backup: %s\n' "$backup" >/dev/tty 2>/dev/null || printf 'Backup: %s\n' "$backup"
   fi
@@ -253,9 +258,9 @@ prompt_remote_tmux_config() {
   fi
 
   if tmux_config_has_features "$file"; then
-    printf 'Remote tmux config already has pi-remote extended-key/help-bar defaults. Reinstall managed block? [y/N]: ' >/dev/tty
+    printf 'Remote tmux config already has the pi-remote features. Add/update the small managed enhancement block without changing the rest of %s? [y/N]: ' "$file" >/dev/tty
   else
-    printf 'Remote tmux config is missing pi-remote defaults (extended keys + "Help: Prefix ?" status hint). Update %s now? [y/N]: ' "$file" >/dev/tty
+    printf 'Remote tmux config is missing pi-remote features (extended keys + "Help: Prefix ?" status hint). Enhance %s now without replacing existing settings? [y/N]: ' "$file" >/dev/tty
   fi
   read -r answer </dev/tty
   case "$answer" in

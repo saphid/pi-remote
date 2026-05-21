@@ -35,7 +35,7 @@ pi-remote --sessions pi-remote
 
 With no switches, `pi-remote` opens an interactive menu: use ↑/↓ (or `j`/`k`) to move, `←`/`→` to expand a project and show its tmux sessions, and Enter to choose a project or session.
 
-On interactive startup, `pi-remote` checks whether the remote `~/.tmux.conf` has the recommended extended-key and bottom-bar help settings. If they are missing, it asks before updating the remote config. Use `pi-remote --configure-tmux` to force that check/prompt, or `--skip-tmux-config` to skip the startup check.
+On interactive startup, `pi-remote` checks whether the remote `~/.tmux.conf` has the recommended extended-key and bottom-bar help settings. If they are missing, it asks before appending/updating a small managed enhancement block; existing tmux config outside that block is preserved. Use `pi-remote --configure-tmux` to force that check/prompt, or `--skip-tmux-config` to skip the startup check.
 
 Use `--no-attach` from non-interactive agents/subagents. It starts the tmux session detached and prints an attach command.
 
