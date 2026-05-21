@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 # Literal remote-shell expression; expanded on LXS01, not on the Mac.
 # shellcheck disable=SC2016
 REMOTE_PROJECT_PATH='"$HOME/projects/pi-remote/pi-remote"'
@@ -19,7 +19,7 @@ Usage:
   pi-remote --project NAME --no-attach [-- AGENT_ARGS...]
   pi-remote --list
 
-Interactive menus use ↑/↓ or j/k and Enter.
+Interactive menus use ↑/↓ or j/k, ←/→ to expand project sessions, and Enter.
 
 Options:
   --host HOST             SSH host to use from the Mac (default: config host, PI_REMOTE_HOST, or LXS01)
@@ -149,6 +149,86 @@ list_projects() {
   find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort
 }
 
+recent_file() {
+  printf '%s\n' "${PI_REMOTE_RECENTS:-$HOME/.cache/pi-remote/recents.tsv}"
+}
+
+project_session_counts() {
+  local root=$1
+  command -v tmux >/dev/null 2>&1 || return 0
+  tmux list-panes -a -F '#{session_name}	#{pane_current_path}	#{pane_current_command}' 2>/dev/null |
+    awk -F '\t' -v root="$root/" '
+      index($2, root) == 1 {
+        rest = substr($2, length(root) + 1)
+        split(rest, parts, "/")
+        project = parts[1]
+        if (project != "") seen[project SUBSEP $1] = 1
+      }
+      END {
+        for (key in seen) {
+          split(key, parts, SUBSEP)
+          counts[parts[1]]++
+        }
+        for (project in counts) print project "\t" counts[project]
+      }
+    '
+}
+
+project_recent_times() {
+  local root=$1
+  local file
+  file=$(recent_file)
+  [[ -r "$file" ]] || return 0
+  awk -F '\t' -v root="$root" '
+    $2 == root {
+      if (($1 + 0) > (recent[$3] + 0)) recent[$3] = $1 + 0
+    }
+    END {
+      for (project in recent) print project "\t" recent[project]
+    }
+  ' "$file"
+}
+
+project_menu_rows() {
+  local root=$1
+  local projects_tmp counts_tmp recents_tmp
+  projects_tmp=$(mktemp)
+  counts_tmp=$(mktemp)
+  recents_tmp=$(mktemp)
+  list_projects "$root" >"$projects_tmp"
+  project_session_counts "$root" >"$counts_tmp"
+  project_recent_times "$root" >"$recents_tmp"
+  awk -F '\t' '
+    FILENAME == ARGV[1] { projects[$1] = 1; order[++n] = $1; next }
+    FILENAME == ARGV[2] { counts[$1] = $2 + 0; next }
+    FILENAME == ARGV[3] { recents[$1] = $2 + 0; next }
+    END {
+      for (i = 1; i <= n; i++) {
+        project = order[i]
+        print project "\t" (counts[project] + 0) "\t" (recents[project] + 0)
+      }
+    }
+  ' "$projects_tmp" "$counts_tmp" "$recents_tmp" | sort -t $'\t' -k3,3nr -k2,2nr -k1,1
+  rm -f "$projects_tmp" "$counts_tmp" "$recents_tmp"
+}
+
+record_recent_project() {
+  local root=$1
+  local project=$2
+  local file tmp now
+  [[ -n "$project" ]] || return 0
+  file=$(recent_file)
+  mkdir -p "$(dirname "$file")"
+  tmp=$(mktemp)
+  if [[ -r "$file" ]]; then
+    awk -F '\t' -v root="$root" -v project="$project" '$2 != root || $3 != project' "$file" >"$tmp"
+  fi
+  now=$(date +%s)
+  printf '%s\t%s\t%s\n' "$now" "$root" "$project" >>"$tmp"
+  sort -t $'\t' -k1,1nr "$tmp" | head -200 >"$file"
+  rm -f "$tmp"
+}
+
 render_arrow_menu() {
   local prompt=$1
   local selected=$2
@@ -157,7 +237,7 @@ render_arrow_menu() {
   shift 4
   local items=("$@")
   local count=${#items[@]}
-  local row index marker label
+  local row index label
 
   printf '\r\033[K%s\n' "$prompt" >/dev/tty
   for ((row = 0; row < visible; row += 1)); do
@@ -165,8 +245,7 @@ render_arrow_menu() {
     if (( index < count )); then
       label=${items[$index]}
       if (( index == selected )); then
-        marker="›"
-        printf '\033[K\033[7m%s %s\033[0m\n' "$marker" "$label" >/dev/tty
+        printf '\033[K\033[7m› %s\033[0m\n' "$label" >/dev/tty
       else
         printf '\033[K  %s\n' "$label" >/dev/tty
       fi
@@ -256,38 +335,6 @@ project_dir_from_arg() {
   fi
 }
 
-pick_project_menu() {
-  local root=$1
-  local projects=()
-  local items=()
-  local choice_index new_name safe_name
-
-  if [[ ! -r /dev/tty ]]; then
-    fail "interactive project menu needs a TTY; pass --project NAME or --new NAME for non-interactive use"
-  fi
-
-  mapfile -t projects < <(list_projects "$root")
-  items=("${projects[@]}" "Create a new project" "Quit")
-
-  choice_index=$(arrow_select "Projects on $(hostname) in $root (↑/↓ or j/k, Enter)" "${items[@]}") || fail "project menu failed"
-
-  if (( choice_index < ${#projects[@]} )); then
-    printf '%s\n' "${projects[$choice_index]}"
-    return 0
-  fi
-
-  if (( choice_index == ${#projects[@]} )); then
-    printf 'New project name: ' >/dev/tty
-    read -r new_name </dev/tty
-    safe_name=$(sanitize_name "$new_name") || fail "empty project name"
-    mkdir -p "$root/$safe_name"
-    printf '%s\n' "$safe_name"
-    return 0
-  fi
-
-  exit 0
-}
-
 list_project_sessions() {
   local project_dir=$1
   command -v tmux >/dev/null 2>&1 || return 0
@@ -295,6 +342,218 @@ list_project_sessions() {
     awk -F '\t' -v project="$project_dir" '
       $2 == project || index($2, project "/") == 1 { if (!seen[$1]++) print $1 }
     ' | sort
+}
+
+MENU_TYPES=()
+MENU_PROJECTS=()
+MENU_SESSIONS=()
+MENU_LABELS=()
+
+expanded_contains() {
+  local expanded=$1
+  local project=$2
+  [[ "$expanded" == *"|$project|"* ]]
+}
+
+build_project_tree_rows() {
+  local root=$1
+  local expanded=$2
+  local project count _recent session
+  MENU_TYPES=()
+  MENU_PROJECTS=()
+  MENU_SESSIONS=()
+  MENU_LABELS=()
+
+  while IFS=$'\t' read -r project count _recent; do
+    [[ -n "$project" ]] || continue
+    MENU_TYPES+=("project")
+    MENU_PROJECTS+=("$project")
+    MENU_SESSIONS+=("")
+    if (( count > 0 )); then
+      if expanded_contains "$expanded" "$project"; then
+        MENU_LABELS+=("▾ $project ($count)")
+      else
+        MENU_LABELS+=("▸ $project ($count)")
+      fi
+    else
+      MENU_LABELS+=("  $project (0)")
+    fi
+
+    if (( count > 0 )) && expanded_contains "$expanded" "$project"; then
+      while IFS= read -r session; do
+        [[ -n "$session" ]] || continue
+        MENU_TYPES+=("session")
+        MENU_PROJECTS+=("$project")
+        MENU_SESSIONS+=("$session")
+        MENU_LABELS+=("    ↳ $session")
+      done < <(list_project_sessions "$root/$project")
+    fi
+  done < <(project_menu_rows "$root")
+
+  MENU_TYPES+=("create")
+  MENU_PROJECTS+=("")
+  MENU_SESSIONS+=("")
+  MENU_LABELS+=("Create a new project")
+  MENU_TYPES+=("quit")
+  MENU_PROJECTS+=("")
+  MENU_SESSIONS+=("")
+  MENU_LABELS+=("Quit")
+}
+
+find_project_row_index() {
+  local project=$1
+  local index
+  for index in "${!MENU_TYPES[@]}"; do
+    if [[ "${MENU_TYPES[$index]}" == "project" && "${MENU_PROJECTS[$index]}" == "$project" ]]; then
+      printf '%s\n' "$index"
+      return 0
+    fi
+  done
+  printf '0\n'
+}
+
+render_project_tree_menu() {
+  local prompt=$1
+  local selected=$2
+  local offset=$3
+  local visible=$4
+  local count=${#MENU_LABELS[@]}
+  local row index label
+
+  printf '\r\033[K%s\n' "$prompt" >/dev/tty
+  for ((row = 0; row < visible; row += 1)); do
+    index=$((offset + row))
+    if (( index < count )); then
+      label=${MENU_LABELS[$index]}
+      if (( index == selected )); then
+        printf '\033[K\033[7m› %s\033[0m\n' "$label" >/dev/tty
+      else
+        printf '\033[K  %s\n' "$label" >/dev/tty
+      fi
+    else
+      printf '\033[K\n' >/dev/tty
+    fi
+  done
+  printf '\033[K[%d/%d] ↑/↓ move  ←/→ expand sessions  Enter select\n' "$((selected + 1))" "$count" >/dev/tty
+}
+
+pick_project_menu() {
+  local root=$1
+  local expanded="|"
+  local selected=0
+  local offset=0
+  local terminal_rows visible lines count
+  local key rest old_stty redraw current_type current_project new_name safe_name selected_session
+
+  if [[ ! -r /dev/tty ]]; then
+    fail "interactive project menu needs a TTY; pass --project NAME or --new NAME for non-interactive use"
+  fi
+
+  build_project_tree_rows "$root" "$expanded"
+  count=${#MENU_LABELS[@]}
+  terminal_rows=$(tput lines 2>/dev/null || printf '24')
+  [[ "$terminal_rows" =~ ^[0-9]+$ ]] || terminal_rows=24
+  visible=$((terminal_rows - 4))
+  (( visible < 5 )) && visible=5
+  (( visible > 20 )) && visible=20
+  (( visible > count )) && visible=$count
+  lines=$((visible + 2))
+
+  old_stty=$(stty -g < /dev/tty)
+  stty -echo -icanon min 1 time 0 < /dev/tty
+  printf '\033[?25l' >/dev/tty
+  render_project_tree_menu "Projects on $(hostname) in $root" "$selected" "$offset" "$visible"
+
+  while IFS= read -rsn1 key < /dev/tty; do
+    redraw=0
+    case "$key" in
+      $'\x1b')
+        rest=""
+        IFS= read -rsn2 rest < /dev/tty || true
+        case "$rest" in
+          '[A'|'OA') selected=$((selected - 1)); redraw=1 ;;
+          '[B'|'OB') selected=$((selected + 1)); redraw=1 ;;
+          '[D'|'OD'|'[C'|'OC')
+            current_type=${MENU_TYPES[$selected]}
+            current_project=${MENU_PROJECTS[$selected]}
+            if [[ "$current_type" == "project" || "$current_type" == "session" ]]; then
+              if [[ -n "$current_project" ]]; then
+                if expanded_contains "$expanded" "$current_project"; then
+                  expanded=${expanded//|$current_project|/|}
+                else
+                  expanded+="$current_project|"
+                fi
+                build_project_tree_rows "$root" "$expanded"
+                count=${#MENU_LABELS[@]}
+                selected=$(find_project_row_index "$current_project")
+                (( visible > count )) && visible=$count
+                redraw=1
+              fi
+            fi
+            ;;
+        esac
+        ;;
+      k|K) selected=$((selected - 1)); redraw=1 ;;
+      j|J) selected=$((selected + 1)); redraw=1 ;;
+      q|Q)
+        stty "$old_stty" < /dev/tty
+        printf '\033[?25h\n' >/dev/tty
+        printf '__PI_REMOTE_QUIT__\t\n'
+        return 0
+        ;;
+      ""|$'\n'|$'\r')
+        current_type=${MENU_TYPES[$selected]}
+        current_project=${MENU_PROJECTS[$selected]}
+        selected_session=${MENU_SESSIONS[$selected]}
+        stty "$old_stty" < /dev/tty
+        printf '\033[?25h\n' >/dev/tty
+        case "$current_type" in
+          project)
+            printf '%s\t\n' "$current_project"
+            return 0
+            ;;
+          session)
+            printf '%s\t%s\n' "$current_project" "$selected_session"
+            return 0
+            ;;
+          create)
+            printf 'New project name: ' >/dev/tty
+            read -r new_name </dev/tty
+            safe_name=$(sanitize_name "$new_name") || fail "empty project name"
+            mkdir -p "$root/$safe_name"
+            printf '%s\t\n' "$safe_name"
+            return 0
+            ;;
+          quit)
+            printf '__PI_REMOTE_QUIT__\t\n'
+            return 0
+            ;;
+        esac
+        ;;
+    esac
+
+    if (( redraw )); then
+      if (( selected < 0 )); then
+        selected=$((count - 1))
+      elif (( selected >= count )); then
+        selected=0
+      fi
+      if (( selected < offset )); then
+        offset=$selected
+      elif (( selected >= offset + visible )); then
+        offset=$((selected - visible + 1))
+      fi
+      if (( offset < 0 )); then
+        offset=0
+      fi
+      printf '\033[%dA' "$lines" >/dev/tty
+      render_project_tree_menu "Projects on $(hostname) in $root" "$selected" "$offset" "$visible"
+    fi
+  done
+
+  stty "$old_stty" < /dev/tty
+  printf '\033[?25h\n' >/dev/tty
+  exit 0
 }
 
 pick_resume_session_menu() {
@@ -395,6 +654,8 @@ run_server() {
   local dry_run=0
   local do_list=0
   local sessions_project=""
+  local selected_session=""
+  local project_was_interactive=0
   local agent=${PI_REMOTE_AGENT:-${configured_agent:-pi}}
   local explicit_command=""
   local agent_args=()
@@ -494,14 +755,27 @@ run_server() {
     validate_existing_name "$project_name" || fail "project names must be simple folder names under $project_root"
     [[ -d "$project_root/$project_name" ]] || fail "project does not exist: $project_root/$project_name (use --new $project_name to create it)"
   else
-    project_name=$(pick_project_menu "$project_root")
+    local project_selection
+    project_selection=$(pick_project_menu "$project_root")
+    project_name=${project_selection%%$'	'*}
+    selected_session=${project_selection#*$'	'}
+    if [[ "$selected_session" == "$project_selection" ]]; then
+      selected_session=""
+    fi
+    if [[ "$project_name" == "__PI_REMOTE_QUIT__" ]]; then
+      exit 0
+    fi
+    project_was_interactive=1
   fi
 
   validate_existing_name "$project_name" || fail "project names must be simple folder names under $project_root"
   local project_dir="$project_root/$project_name"
   [[ -d "$project_dir" ]] || fail "project directory was not created: $project_dir"
 
-  if (( explicit_session == 0 )) && (( no_attach == 0 )) && (( dry_run == 0 )); then
+  if [[ -n "$selected_session" ]]; then
+    session_name=$selected_session
+    explicit_session=1
+  elif (( project_was_interactive == 0 && explicit_session == 0 && no_attach == 0 && dry_run == 0 )); then
     local resume_session=""
     if resume_session=$(pick_resume_session_menu "$project_dir"); then
       session_name=$resume_session
@@ -535,11 +809,14 @@ run_server() {
     printf 'project_root=%s\n' "$project_root"
     printf 'project_dir=%s\n' "$project_dir"
     printf 'tmux_session=%s\n' "$session_name"
+    printf 'selected_session=%s\n' "$selected_session"
     printf 'agent=%s\n' "$agent"
     printf 'attach=%s\n' "$([[ $no_attach -eq 1 ]] && printf no || printf yes)"
     printf 'command=%s\n' "$agent_command"
     exit 0
   fi
+
+  record_recent_project "$project_root" "$project_name"
 
   if session_exists "$session_name"; then
     if (( no_attach )); then
@@ -685,9 +962,11 @@ run_local() {
 
   local quoted_args=""
   local item
-  for item in "${server_args[@]}"; do
-    quoted_args+=" $(shell_quote "$item")"
-  done
+  if (( ${#server_args[@]} > 0 )); then
+    for item in "${server_args[@]}"; do
+      quoted_args+=" $(shell_quote "$item")"
+    done
+  fi
 
   local quoted_host
   quoted_host=$(shell_quote "$host")
