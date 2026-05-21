@@ -6,19 +6,19 @@
 
 It ships with two equivalent entry points:
 
-- `pi-remote`: the TypeScript/Node CLI.
+- `pi-remote`: the TypeScript/Bun CLI.
 - `pi-remote.sh`: the Bash CLI.
 
 Both entry points use local OpenSSH plus remote Bash, remote `tmux`, and whichever agent command you want to run (`pi`, `claude`, `codex`, or a custom command).
 
 ## Install
 
-Install the TypeScript/Node CLI from a checkout:
+Install the TypeScript/Bun CLI from a checkout:
 
 ```bash
-npm install
-npm run build
-npm install -g .
+bun install
+bun run build
+bun link
 ```
 
 Or install the Bash CLI directly:
@@ -39,7 +39,7 @@ Install or update the helper copy on the remote host:
 pi-remote --install-remote
 ```
 
-The Bash remote helper is installed at `~/projects/pi-remote/pi-remote.sh` and linked to `~/.local/bin/pi-remote.sh`. A `~/projects/pi-remote/pi-remote` wrapper is installed too; it uses the Node implementation when available and falls back to `pi-remote.sh` otherwise.
+The Bash remote helper is installed at `~/projects/pi-remote/pi-remote.sh` and linked to `~/.local/bin/pi-remote.sh`. A `~/projects/pi-remote/pi-remote` wrapper is installed too; it uses the Bun implementation when available and falls back to `pi-remote.sh` otherwise.
 
 ## Usage
 

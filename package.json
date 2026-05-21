@@ -1,7 +1,7 @@
 {
   "name": "pi-remote",
   "version": "1.0.0",
-  "description": "Tiny SSH/tmux launcher for remote coding-agent sessions.",
+  "description": "Tiny SSH/tmux launcher for remote coding-agent sessions, packaged for Bun.",
   "bin": {
     "pi-remote": "dist/pi-remote.js",
     "pi-remote.sh": "pi-remote.sh"
@@ -16,10 +16,11 @@
   "scripts": {
     "build": "tsc",
     "check": "tsc --noEmit",
-    "prepare": "npm run build"
+    "prepack": "bun run build"
   },
   "devDependencies": {
-    "@types/node": "^24.10.1",
+    "@types/bun": "^1.3.3",
     "typescript": "^5.9.3"
-  }
+  },
+  "packageManager": "bun@1.3.13"
 }

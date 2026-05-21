@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 set -eu
-PATH="$HOME/.local/npm-global/bin:$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
+PATH="$HOME/.bun/bin:$HOME/.local/bin:$PATH"
 export PATH
 SOURCE=$0
 while [ -L "$SOURCE" ]; do
@@ -12,7 +12,7 @@ while [ -L "$SOURCE" ]; do
   esac
 done
 DIR=$(CDPATH='' cd -P -- "$(dirname -- "$SOURCE")" && pwd)
-if command -v node >/dev/null 2>&1 && [ -r "$DIR/dist/pi-remote.js" ]; then
-  exec node "$DIR/dist/pi-remote.js" "$@"
+if command -v bun >/dev/null 2>&1 && [ -r "$DIR/dist/pi-remote.js" ]; then
+  exec bun "$DIR/dist/pi-remote.js" "$@"
 fi
 exec "$DIR/pi-remote.sh" "$@"
