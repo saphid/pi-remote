@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 # Literal remote-shell expression; expanded on LXS01, not on the Mac.
 # shellcheck disable=SC2016
 REMOTE_PROJECT_PATH='"$HOME/projects/pi-remote/pi-remote"'
@@ -12,12 +12,14 @@ usage() {
 pi-remote - tiny SSH/tmux launcher for coding agents on LXS01
 
 Usage:
-  pi-remote                                SSH to LXS01, pick/create a project, attach to an agent in tmux
+  pi-remote                                SSH to LXS01, arrow-pick/create a project, attach to an agent in tmux
   pi-remote --project NAME                 Start/attach for an existing ~/projects/NAME
   pi-remote --new NAME                     Create ~/projects/NAME, then start/attach
   pi-remote --agent pi|claude|codex        Choose the remote agent command (default: pi)
   pi-remote --project NAME --no-attach [-- AGENT_ARGS...]
   pi-remote --list
+
+Interactive menus use ↑/↓ or j/k and Enter.
 
 Options:
   --host HOST             SSH host to use from the Mac (default: config host, PI_REMOTE_HOST, or LXS01)
@@ -147,6 +149,103 @@ list_projects() {
   find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort
 }
 
+render_arrow_menu() {
+  local prompt=$1
+  local selected=$2
+  local offset=$3
+  local visible=$4
+  shift 4
+  local items=("$@")
+  local count=${#items[@]}
+  local row index marker label
+
+  printf '\r\033[K%s\n' "$prompt" >/dev/tty
+  for ((row = 0; row < visible; row += 1)); do
+    index=$((offset + row))
+    if (( index < count )); then
+      label=${items[$index]}
+      if (( index == selected )); then
+        marker="›"
+        printf '\033[K\033[7m%s %s\033[0m\n' "$marker" "$label" >/dev/tty
+      else
+        printf '\033[K  %s\n' "$label" >/dev/tty
+      fi
+    else
+      printf '\033[K\n' >/dev/tty
+    fi
+  done
+  printf '\033[K[%d/%d] ↑/↓ or j/k, Enter\n' "$((selected + 1))" "$count" >/dev/tty
+}
+
+arrow_select() {
+  local prompt=$1
+  shift
+  local items=("$@")
+  local count=${#items[@]}
+  local selected=0
+  local offset=0
+  local terminal_rows visible lines
+  local key rest old_stty redraw
+
+  (( count > 0 )) || return 1
+  [[ -r /dev/tty ]] || return 1
+
+  terminal_rows=$(tput lines 2>/dev/null || printf '24')
+  [[ "$terminal_rows" =~ ^[0-9]+$ ]] || terminal_rows=24
+  visible=$((terminal_rows - 4))
+  (( visible < 5 )) && visible=5
+  (( visible > 20 )) && visible=20
+  (( visible > count )) && visible=$count
+  lines=$((visible + 2))
+
+  old_stty=$(stty -g < /dev/tty)
+  stty -echo -icanon min 1 time 0 < /dev/tty
+  printf '\033[?25l' >/dev/tty
+  render_arrow_menu "$prompt" "$selected" "$offset" "$visible" "${items[@]}"
+
+  while IFS= read -rsn1 key < /dev/tty; do
+    redraw=0
+    case "$key" in
+      $'\x1b')
+        rest=""
+        IFS= read -rsn2 rest < /dev/tty || true
+        case "$rest" in
+          '[A'|'OA') selected=$((selected - 1)); redraw=1 ;;
+          '[B'|'OB') selected=$((selected + 1)); redraw=1 ;;
+        esac
+        ;;
+      k|K) selected=$((selected - 1)); redraw=1 ;;
+      j|J) selected=$((selected + 1)); redraw=1 ;;
+      q|Q)
+        selected=$((count - 1))
+        break
+        ;;
+      ""|$'\n'|$'\r')
+        break
+        ;;
+    esac
+
+    if (( redraw )); then
+      if (( selected < 0 )); then
+        selected=$((count - 1))
+      elif (( selected >= count )); then
+        selected=0
+      fi
+      if (( selected < offset )); then
+        offset=$selected
+      elif (( selected >= offset + visible )); then
+        offset=$((selected - visible + 1))
+      fi
+      printf '\033[%dA' "$lines" >/dev/tty
+      render_arrow_menu "$prompt" "$selected" "$offset" "$visible" "${items[@]}"
+    fi
+  done
+
+  stty "$old_stty" < /dev/tty
+  printf '\033[?25h\n' >/dev/tty
+  printf '%s\n' "$selected"
+}
+
 project_dir_from_arg() {
   local root=$1
   local project=$2
@@ -160,33 +259,24 @@ project_dir_from_arg() {
 pick_project_menu() {
   local root=$1
   local projects=()
-  local choice new_name safe_name index
+  local items=()
+  local choice_index new_name safe_name
 
   if [[ ! -r /dev/tty ]]; then
     fail "interactive project menu needs a TTY; pass --project NAME or --new NAME for non-interactive use"
   fi
 
   mapfile -t projects < <(list_projects "$root")
+  items=("${projects[@]}" "Create a new project" "Quit")
 
-  printf '\nProjects on %s in %s\n' "$(hostname)" "$root" >/dev/tty
-  if (( ${#projects[@]} == 0 )); then
-    printf '  (none yet)\n' >/dev/tty
-  else
-    for index in "${!projects[@]}"; do
-      printf '  %2d) %s\n' "$((index + 1))" "${projects[$index]}" >/dev/tty
-    done
-  fi
-  printf '   n) Create a new project\n' >/dev/tty
-  printf '   q) Quit\n' >/dev/tty
-  printf 'Choose project [1]: ' >/dev/tty
-  read -r choice </dev/tty
-  choice=${choice:-1}
+  choice_index=$(arrow_select "Projects on $(hostname) in $root (↑/↓ or j/k, Enter)" "${items[@]}") || fail "project menu failed"
 
-  if [[ "$choice" == "q" || "$choice" == "Q" ]]; then
-    exit 0
+  if (( choice_index < ${#projects[@]} )); then
+    printf '%s\n' "${projects[$choice_index]}"
+    return 0
   fi
 
-  if [[ "$choice" == "n" || "$choice" == "N" ]]; then
+  if (( choice_index == ${#projects[@]} )); then
     printf 'New project name: ' >/dev/tty
     read -r new_name </dev/tty
     safe_name=$(sanitize_name "$new_name") || fail "empty project name"
@@ -195,12 +285,7 @@ pick_project_menu() {
     return 0
   fi
 
-  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#projects[@]} )); then
-    printf '%s\n' "${projects[$((choice - 1))]}"
-    return 0
-  fi
-
-  fail "invalid project choice: $choice"
+  exit 0
 }
 
 list_project_sessions() {
@@ -215,30 +300,24 @@ list_project_sessions() {
 pick_resume_session_menu() {
   local project_dir=$1
   local sessions=()
-  local choice index
+  local items=("Start a new session")
+  local session choice_index
 
   [[ -r /dev/tty ]] || return 1
   mapfile -t sessions < <(list_project_sessions "$project_dir")
   (( ${#sessions[@]} > 0 )) || return 1
 
-  printf '\nExisting tmux sessions for %s\n' "$project_dir" >/dev/tty
-  for index in "${!sessions[@]}"; do
-    printf '  %2d) Resume %s\n' "$((index + 1))" "${sessions[$index]}" >/dev/tty
+  for session in "${sessions[@]}"; do
+    items+=("Resume $session")
   done
-  printf '   n) Start a new session\n' >/dev/tty
-  printf 'Choose session to resume [n]: ' >/dev/tty
-  read -r choice </dev/tty
-  choice=${choice:-n}
 
-  if [[ "$choice" == "n" || "$choice" == "N" ]]; then
+  choice_index=$(arrow_select "Existing tmux sessions for $project_dir (↑/↓ or j/k, Enter)" "${items[@]}") || return 1
+  if (( choice_index == 0 )); then
     return 1
   fi
-  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#sessions[@]} )); then
-    printf '%s\n' "${sessions[$((choice - 1))]}"
-    return 0
-  fi
 
-  fail "invalid tmux session choice: $choice"
+  printf '%s\n' "${sessions[$((choice_index - 1))]}"
+  return 0
 }
 
 session_exists() {

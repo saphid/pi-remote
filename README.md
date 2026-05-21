@@ -5,8 +5,8 @@ A deliberately tiny launcher for running a coding-agent CLI on LXS01.
 Default flow:
 
 1. SSH from the MacBook into LXS01 (`LXS01`/`lxs01` alias the existing `lxso1` SSH config).
-2. Show folders in `~/projects` as a menu, or create a new folder there.
-3. After a project is selected, show existing tmux sessions whose panes are already in that project so one can be resumed.
+2. Show folders in `~/projects` as an arrow-key menu, or create a new folder there.
+3. After a project is selected, show existing tmux sessions whose panes are already in that project as an arrow-key resume menu.
 4. Otherwise create a tmux session named `pi-remote-<project>` and start the selected agent.
 
 The default agent is `pi`, but `claude` and `codex` are supported too.
@@ -30,6 +30,8 @@ pi-remote --project pi-remote --session pi-remote-agent --no-attach -- "Review t
 pi-remote --list
 pi-remote --sessions pi-remote
 ```
+
+With no switches, `pi-remote` opens an interactive menu: use ↑/↓ (or `j`/`k`) and Enter to pick a project, create one, or pick an existing project tmux session to resume.
 
 Use `--no-attach` from non-interactive agents/subagents. It starts the tmux session detached and prints an attach command.
 
