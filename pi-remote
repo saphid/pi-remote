@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.6.0"
+VERSION="0.7.0"
 # Literal remote-shell expression; expanded on LXS01, not on the Mac.
 # shellcheck disable=SC2016
 REMOTE_PROJECT_PATH='"$HOME/projects/pi-remote/pi-remote"'
@@ -168,11 +168,101 @@ tmux_config_has_features() {
   [[ -r "$file" ]] || return 1
   grep -q 'set -s extended-keys on' "$file" || return 1
   grep -q 'set -g xterm-keys on' "$file" || return 1
-  grep -q 'Help: Prefix ?' "$file" || return 1
+  grep -Eq 'help .*detach .*quit ' "$file" || return 1
+}
+
+format_tmux_key() {
+  local key=$1
+  local suffix
+  case "$key" in
+    C-*)
+      suffix=${key#C-}
+      if [[ ${#suffix} -eq 1 ]]; then
+        suffix=$(printf '%s' "$suffix" | tr '[:lower:]' '[:upper:]')
+      fi
+      printf 'Ctrl+%s' "$suffix"
+      ;;
+    M-*)
+      suffix=${key#M-}
+      if [[ ${#suffix} -eq 1 ]]; then
+        suffix=$(printf '%s' "$suffix" | tr '[:lower:]' '[:upper:]')
+      fi
+      printf 'Alt+%s' "$suffix"
+      ;;
+    Space) printf 'Space' ;;
+    *) printf '%s' "$key" ;;
+  esac
+}
+
+format_tmux_chord() {
+  local prefix=$1
+  local key=$2
+  local prefix_display key_display
+  prefix_display=$(format_tmux_key "$prefix")
+  key_display=$(format_tmux_key "$key")
+  if [[ "$key_display" == "?" ]]; then
+    printf '%s?' "$prefix_display"
+  else
+    printf '%s %s' "$prefix_display" "$key_display"
+  fi
+}
+
+binding_key_for() {
+  local keys=$1
+  local pattern=$2
+  local fallback=$3
+  local key
+  key=$(awk -v pattern="$pattern" '
+    $1 == "bind-key" && $2 == "-T" && $3 == "prefix" {
+      key = $4
+      command = $0
+      sub(/^[^ ]+[[:space:]]+-T[[:space:]]+prefix[[:space:]]+[^[:space:]]+[[:space:]]+/, "", command)
+      if (command ~ pattern) {
+        print key
+        exit
+      }
+    }
+  ' <<<"$keys")
+  printf '%s\n' "${key:-$fallback}"
+}
+
+build_tmux_help_hint() {
+  local file=$1
+  local socket prefix keys help_key detach_key quit_key
+  local help_chord detach_chord quit_chord
+  socket="pi-remote-hint-$$"
+  if tmux -L "$socket" -f "$file" new-session -d -s pi-remote-hint-smoke 'sleep 1' 2>/dev/null; then
+    prefix=$(tmux -L "$socket" show -gqv prefix 2>/dev/null || printf 'C-b')
+    keys=$(tmux -L "$socket" list-keys -T prefix 2>/dev/null || true)
+    tmux -L "$socket" kill-server >/dev/null 2>&1 || true
+  else
+    prefix="C-b"
+    keys=""
+  fi
+
+  help_key=$(binding_key_for "$keys" '^list-keys([[:space:]]|$)' '?')
+  detach_key=$(binding_key_for "$keys" '^detach-client([[:space:]]|$)' 'd')
+  quit_key=$(binding_key_for "$keys" '^(kill-pane([[:space:]]|$)|confirm-before .*kill-pane)' 'x')
+  if [[ -z "$quit_key" ]]; then
+    quit_key=$(binding_key_for "$keys" '^(kill-window([[:space:]]|$)|confirm-before .*kill-window)' '&')
+  fi
+
+  help_chord=$(format_tmux_chord "$prefix" "$help_key")
+  detach_chord=$(format_tmux_chord "$prefix" "$detach_key")
+  quit_chord=$(format_tmux_chord "$prefix" "$quit_key")
+  printf 'help %s  detach %s  quit %s\n' "$help_chord" "$detach_chord" "$quit_chord"
+}
+
+escape_single_quotes() {
+  local value=$1
+  printf '%s' "${value//\'/\'\\\'\'}"
 }
 
 render_tmux_config_block() {
-  cat <<'EOF'
+  local hint=$1
+  local escaped_hint
+  escaped_hint=$(escape_single_quotes "$hint")
+  cat <<EOF
 # BEGIN pi-remote tmux enhancements
 # Managed by pi-remote. This block is appended/updated without changing the rest of your tmux config.
 # It enables modern modified-key passthrough for agent TUIs and advertises tmux's help screen.
@@ -182,18 +272,19 @@ set -g terminal-features[90] 'xterm*:extkeys'
 set -g terminal-features[91] 'screen*:extkeys'
 set -g terminal-features[92] 'tmux*:extkeys'
 set -g status on
-set -g status-format[0] '#[align=left]#{E:status-left}#[align=centre,bold]Help: Prefix ?#[default]#[align=right]#{E:status-right}'
+set -g status-format[0] '#[align=left]#{E:status-left}#[align=centre,bold]$escaped_hint#[default]#[align=right]#{E:status-right}'
 # END pi-remote tmux enhancements
 EOF
 }
 
 apply_remote_tmux_config() {
-  local file tmp block_file backup socket
+  local file tmp block_file backup socket hint
   file=$(tmux_config_file)
   mkdir -p "$(dirname "$file")"
   tmp=$(mktemp)
   block_file=$(mktemp)
-  render_tmux_config_block >"$block_file"
+  hint=$(build_tmux_help_hint "$file")
+  render_tmux_config_block "$hint" >"$block_file"
 
   if [[ -f "$file" ]]; then
     backup="$file.backup-$(date +%Y%m%d-%H%M%S)"
@@ -240,6 +331,7 @@ apply_remote_tmux_config() {
 
   tmux source-file "$file" >/dev/null 2>&1 || true
   printf 'Enhanced remote tmux config: %s\n' "$file" >/dev/tty 2>/dev/null || printf 'Enhanced remote tmux config: %s\n' "$file"
+  printf 'Status help hint: %s\n' "$hint" >/dev/tty 2>/dev/null || printf 'Status help hint: %s\n' "$hint"
   if [[ -n "$backup" ]]; then
     printf 'Backup: %s\n' "$backup" >/dev/tty 2>/dev/null || printf 'Backup: %s\n' "$backup"
   fi
@@ -258,9 +350,9 @@ prompt_remote_tmux_config() {
   fi
 
   if tmux_config_has_features "$file"; then
-    printf 'Remote tmux config already has the pi-remote features. Add/update the small managed enhancement block without changing the rest of %s? [y/N]: ' "$file" >/dev/tty
+    printf 'Remote tmux config already has the pi-remote features. Recompute/update the managed help hint without changing the rest of %s? [y/N]: ' "$file" >/dev/tty
   else
-    printf 'Remote tmux config is missing pi-remote features (extended keys + "Help: Prefix ?" status hint). Enhance %s now without replacing existing settings? [y/N]: ' "$file" >/dev/tty
+    printf 'Remote tmux config is missing current pi-remote features (extended keys + explicit shortcut hint). Enhance %s now without replacing existing settings? [y/N]: ' "$file" >/dev/tty
   fi
   read -r answer </dev/tty
   case "$answer" in
