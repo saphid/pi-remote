@@ -2,16 +2,29 @@
 
 ![pi-remote banner](assets/readme-banner.png)
 
-`pi-remote` is a small Bash launcher for remote coding-agent sessions. It SSHes to a configured host, lets you pick or create a project under a remote project root, and starts or resumes a `tmux` session running your chosen agent CLI.
+`pi-remote` is a small launcher for remote coding-agent sessions. It SSHes to a configured host, lets you pick or create a project under a remote project root, and starts or resumes a `tmux` session running your chosen agent CLI.
 
-It is intentionally dependency-light: local OpenSSH, remote Bash, remote `tmux`, and whichever agent command you want to run (`pi`, `claude`, `codex`, or a custom command).
+It ships with two equivalent entry points:
+
+- `pi-remote`: the TypeScript/Node CLI.
+- `pi-remote.sh`: the Bash CLI.
+
+Both entry points use local OpenSSH plus remote Bash, remote `tmux`, and whichever agent command you want to run (`pi`, `claude`, `codex`, or a custom command).
 
 ## Install
 
-Put the script on your local `PATH`:
+Install the TypeScript/Node CLI from a checkout:
 
 ```bash
-install -m 0755 pi-remote ~/.local/bin/pi-remote
+npm install
+npm run build
+npm install -g .
+```
+
+Or install the Bash CLI directly:
+
+```bash
+install -m 0755 pi-remote.sh ~/.local/bin/pi-remote.sh
 ```
 
 Create a local config for your SSH host:
@@ -26,12 +39,13 @@ Install or update the helper copy on the remote host:
 pi-remote --install-remote
 ```
 
-The remote helper is installed at `~/projects/pi-remote/pi-remote` and linked to `~/.local/bin/pi-remote` on the remote host.
+The Bash remote helper is installed at `~/projects/pi-remote/pi-remote.sh` and linked to `~/.local/bin/pi-remote.sh`. A `~/projects/pi-remote/pi-remote` wrapper is installed too; it uses the Node implementation when available and falls back to `pi-remote.sh` otherwise.
 
 ## Usage
 
 ```bash
 pi-remote
+pi-remote.sh
 pi-remote --project my-project
 pi-remote --new my-project
 pi-remote --agent claude --project my-project
@@ -44,7 +58,7 @@ pi-remote --sessions my-project
 
 With no switches, `pi-remote` opens an interactive menu. Use ↑/↓ or `j`/`k` to move, ←/→ to expand or collapse a project's current `tmux` sessions, and Enter to choose a project or session.
 
-Use `--no-attach` from non-interactive automation. It starts the `tmux` session detached and prints an attach command.
+Use `--no-attach` from non-interactive automation. It starts the `tmux` session detached and prints an attach command. The same options are available through `pi-remote` and `pi-remote.sh`.
 
 ## Config
 
