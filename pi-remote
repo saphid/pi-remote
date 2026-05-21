@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 # Literal remote-shell expression; expanded on LXS01, not on the Mac.
 # shellcheck disable=SC2016
 REMOTE_PROJECT_PATH='"$HOME/projects/pi-remote/pi-remote"'
@@ -17,6 +17,7 @@ Usage:
   pi-remote --new NAME                     Create ~/projects/NAME, then start/attach
   pi-remote --agent pi|claude|codex        Choose the remote agent command (default: pi)
   pi-remote --project NAME --no-attach [-- AGENT_ARGS...]
+  pi-remote --configure-tmux              Check/update remote tmux defaults, then exit
   pi-remote --list
 
 Interactive menus use ↑/↓ or j/k, ←/→ to expand project sessions, and Enter.
@@ -29,6 +30,8 @@ Options:
   --agent NAME            Remote agent: pi, claude, codex, or custom (default from config/env: pi)
   --command COMMAND       Custom remote launch command; overrides --agent command lookup
   --no-attach             Create the tmux session detached and print the attach command
+  --configure-tmux       Ask to install/update pi-remote tmux defaults on LXS01 and exit
+  --skip-tmux-config     Do not prompt about remote tmux config during interactive startup
   --list                  List remote projects and exit
   --sessions PROJECT      List tmux sessions whose panes are in PROJECT and exit
   --dry-run               Print what would run without creating/attaching tmux
@@ -54,6 +57,7 @@ Environment:
   PI_REMOTE_AGENT         Default agent for server mode.
   PI_REMOTE_LAUNCH_COMMAND Custom launch command for server mode.
   PI_REMOTE_PI_BIN        Default Pi executable for server mode.
+  PI_REMOTE_TMUX_CONFIG   Remote tmux config path (default: ~/.tmux.conf).
 
 Subagent-friendly example:
   pi-remote --project pi-remote --session pi-remote-agent --no-attach -- "Review this project"
@@ -147,6 +151,117 @@ list_projects() {
   local root=$1
   mkdir -p "$root"
   find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort
+}
+
+tmux_config_file() {
+  printf '%s\n' "${PI_REMOTE_TMUX_CONFIG:-$HOME/.tmux.conf}"
+}
+
+tmux_config_has_features() {
+  local file=$1
+  [[ -r "$file" ]] || return 1
+  grep -q 'set -s extended-keys on' "$file" || return 1
+  grep -q 'set -g xterm-keys on' "$file" || return 1
+  grep -q 'Help: Prefix ?' "$file" || return 1
+}
+
+render_tmux_config_block() {
+  cat <<'EOF'
+# BEGIN pi-remote tmux defaults
+# Managed by pi-remote. Adds remote-agent-friendly key handling and a help hint.
+set -g mouse on
+set -s extended-keys on
+set -g xterm-keys on
+set -g terminal-features[90] 'xterm*:extkeys'
+set -g terminal-features[91] 'screen*:extkeys'
+set -g terminal-features[92] 'tmux*:extkeys'
+set -g status on
+set -g status-position bottom
+set -g status-style bg=green,fg=black
+set -g status-left '[#S] #I:#W '
+set -g status-left-length 40
+set -g status-right '%H:%M %d-%b-%y'
+set -g status-right-length 30
+set -g status-format[0] '#[align=left][#S] #I:#W #[align=centre,bold]Help: Prefix ?#[default]#[align=right]%H:%M %d-%b-%y'
+# END pi-remote tmux defaults
+EOF
+}
+
+apply_remote_tmux_config() {
+  local file tmp block_file backup socket
+  file=$(tmux_config_file)
+  mkdir -p "$(dirname "$file")"
+  tmp=$(mktemp)
+  block_file=$(mktemp)
+  render_tmux_config_block >"$block_file"
+
+  if [[ -f "$file" ]]; then
+    backup="$file.backup-$(date +%Y%m%d-%H%M%S)"
+    cp "$file" "$backup"
+  else
+    backup=""
+    : >"$file"
+  fi
+
+  if grep -q '^# BEGIN pi-remote tmux defaults$' "$file"; then
+    awk -v block="$block_file" '
+      $0 == "# BEGIN pi-remote tmux defaults" {
+        while ((getline line < block) > 0) print line
+        in_block = 1
+        next
+      }
+      $0 == "# END pi-remote tmux defaults" { in_block = 0; next }
+      !in_block { print }
+    ' "$file" >"$tmp"
+  else
+    { cat "$file"; printf '\n'; cat "$block_file"; } >"$tmp"
+  fi
+
+  install -m 0644 "$tmp" "$file"
+  rm -f "$tmp" "$block_file"
+
+  socket="pi-remote-config-test-$$"
+  if ! tmux -L "$socket" -f "$file" new-session -d -s pi-remote-config-smoke 'sleep 1' 2>/tmp/pi-remote-tmux-config-error.$$; then
+    if [[ -n "$backup" && -f "$backup" ]]; then
+      cp "$backup" "$file"
+    fi
+    printf 'pi-remote: tmux config validation failed; restored previous config.\n' >&2
+    cat /tmp/pi-remote-tmux-config-error.$$ >&2 || true
+    rm -f /tmp/pi-remote-tmux-config-error.$$
+    return 1
+  fi
+  tmux -L "$socket" kill-server >/dev/null 2>&1 || true
+  rm -f /tmp/pi-remote-tmux-config-error.$$
+
+  tmux source-file "$file" >/dev/null 2>&1 || true
+  printf 'Updated remote tmux config: %s\n' "$file" >/dev/tty 2>/dev/null || printf 'Updated remote tmux config: %s\n' "$file"
+  if [[ -n "$backup" ]]; then
+    printf 'Backup: %s\n' "$backup" >/dev/tty 2>/dev/null || printf 'Backup: %s\n' "$backup"
+  fi
+}
+
+prompt_remote_tmux_config() {
+  local force=${1:-0}
+  local file answer
+  file=$(tmux_config_file)
+  if (( force == 0 )) && tmux_config_has_features "$file"; then
+    return 0
+  fi
+
+  if [[ ! -r /dev/tty ]]; then
+    return 0
+  fi
+
+  if tmux_config_has_features "$file"; then
+    printf 'Remote tmux config already has pi-remote extended-key/help-bar defaults. Reinstall managed block? [y/N]: ' >/dev/tty
+  else
+    printf 'Remote tmux config is missing pi-remote defaults (extended keys + "Help: Prefix ?" status hint). Update %s now? [y/N]: ' "$file" >/dev/tty
+  fi
+  read -r answer </dev/tty
+  case "$answer" in
+    y|Y|yes|YES) apply_remote_tmux_config ;;
+    *) printf 'Skipping remote tmux config update.\n' >/dev/tty ;;
+  esac
 }
 
 recent_file() {
@@ -653,6 +768,8 @@ run_server() {
   local no_attach=0
   local dry_run=0
   local do_list=0
+  local configure_tmux=0
+  local skip_tmux_config=0
   local sessions_project=""
   local selected_session=""
   local project_was_interactive=0
@@ -714,6 +831,8 @@ run_server() {
       --pi-bin=*) explicit_command=${arg#--pi-bin=}; agent=pi ;;
       --no-attach) no_attach=1 ;;
       --dry-run) dry_run=1 ;;
+      --configure-tmux) configure_tmux=1 ;;
+      --skip-tmux-config) skip_tmux_config=1 ;;
       --list) do_list=1 ;;
       --sessions)
         (($#)) || fail "--sessions requires a project name or path"
@@ -740,6 +859,15 @@ run_server() {
 
   export PATH="$HOME/.local/npm-global/bin:$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
   command -v tmux >/dev/null 2>&1 || fail "tmux is not installed on $(hostname)"
+
+  if (( configure_tmux )); then
+    prompt_remote_tmux_config 1
+    exit 0
+  fi
+
+  if (( skip_tmux_config == 0 && do_list == 0 && no_attach == 0 && dry_run == 0 )) && [[ -z "$sessions_project" ]]; then
+    prompt_remote_tmux_config 0
+  fi
 
   if [[ -n "$sessions_project" ]]; then
     local sessions_dir
@@ -880,6 +1008,7 @@ run_local() {
   local no_attach=0
   local do_list=0
   local dry_run=0
+  local configure_tmux=0
   local has_project=0
   local has_new=0
   local do_sessions=0
@@ -927,6 +1056,8 @@ run_local() {
       --sessions=*) do_sessions=1; server_args+=("$arg") ;;
       --no-attach) no_attach=1; server_args+=("$arg") ;;
       --list) do_list=1; server_args+=("$arg") ;;
+      --configure-tmux) configure_tmux=1; server_args+=("$arg") ;;
+      --skip-tmux-config) server_args+=("$arg") ;;
       --dry-run) dry_run=1; server_args+=("$arg") ;;
       --)
         server_args+=("--" "$@")
@@ -948,6 +1079,8 @@ run_local() {
 
   if (( do_list || do_sessions )); then
     needs_tty=0
+  elif (( configure_tmux )); then
+    needs_tty=1
   elif (( no_attach )) && (( has_project || has_new )); then
     needs_tty=0
   elif (( dry_run )) && (( has_project || has_new )); then
