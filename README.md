@@ -13,7 +13,13 @@ Both entry points use local OpenSSH plus remote Bash, remote `tmux`, and whichev
 
 ## Install
 
-Install the TypeScript/Bun CLI from a checkout:
+Install the TypeScript/Bun CLI globally from GitHub:
+
+```bash
+bun install -g github:saphid/pi-remote
+```
+
+Or install from a local checkout while developing:
 
 ```bash
 bun install
