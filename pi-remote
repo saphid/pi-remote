@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.8.0"
+VERSION="0.8.1"
 # Literal remote-shell expression; expanded on LXS01, not on the Mac.
 # shellcheck disable=SC2016
 REMOTE_PROJECT_PATH='"$HOME/projects/pi-remote/pi-remote"'
@@ -248,9 +248,12 @@ build_tmux_help_hint() {
 
   help_key=$(binding_key_for "$keys" '^list-keys([[:space:]]|$)' '?')
   detach_key=$(binding_key_for "$keys" '^detach-client([[:space:]]|$)' 'd')
-  quit_key=$(binding_key_for "$keys" '^(kill-pane([[:space:]]|$)|confirm-before .*kill-pane)' 'x')
+  quit_key=$(binding_key_for "$keys" '^(kill-pane([[:space:]]|$)|confirm-before .*kill-pane)' '')
   if [[ -z "$quit_key" ]]; then
-    quit_key=$(binding_key_for "$keys" '^(kill-window([[:space:]]|$)|confirm-before .*kill-window)' '&')
+    quit_key=$(binding_key_for "$keys" '^(kill-window([[:space:]]|$)|confirm-before .*kill-window)' '')
+  fi
+  if [[ -z "$quit_key" ]]; then
+    quit_key='x'
   fi
 
   help_chord=$(format_tmux_chord "$prefix" "$help_key")
