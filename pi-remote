@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.7.0"
+VERSION="0.8.0"
 # Literal remote-shell expression; expanded on LXS01, not on the Mac.
 # shellcheck disable=SC2016
 REMOTE_PROJECT_PATH='"$HOME/projects/pi-remote/pi-remote"'
@@ -230,14 +230,20 @@ build_tmux_help_hint() {
   local file=$1
   local socket prefix keys help_key detach_key quit_key
   local help_chord detach_chord quit_chord
-  socket="pi-remote-hint-$$"
-  if tmux -L "$socket" -f "$file" new-session -d -s pi-remote-hint-smoke 'sleep 1' 2>/dev/null; then
-    prefix=$(tmux -L "$socket" show -gqv prefix 2>/dev/null || printf 'C-b')
-    keys=$(tmux -L "$socket" list-keys -T prefix 2>/dev/null || true)
-    tmux -L "$socket" kill-server >/dev/null 2>&1 || true
+
+  if [[ "$file" == "$HOME/.tmux.conf" ]] && tmux show -gqv prefix >/dev/null 2>&1; then
+    prefix=$(tmux show -gqv prefix 2>/dev/null || printf 'C-b')
+    keys=$(tmux list-keys -T prefix 2>/dev/null || true)
   else
-    prefix="C-b"
-    keys=""
+    socket="pi-remote-hint-$$"
+    if tmux -L "$socket" -f "$file" new-session -d -s pi-remote-hint-smoke 'sleep 1' 2>/dev/null; then
+      prefix=$(tmux -L "$socket" show -gqv prefix 2>/dev/null || printf 'C-b')
+      keys=$(tmux -L "$socket" list-keys -T prefix 2>/dev/null || true)
+      tmux -L "$socket" kill-server >/dev/null 2>&1 || true
+    else
+      prefix="C-b"
+      keys=""
+    fi
   fi
 
   help_key=$(binding_key_for "$keys" '^list-keys([[:space:]]|$)' '?')
@@ -329,7 +335,9 @@ apply_remote_tmux_config() {
   tmux -L "$socket" kill-server >/dev/null 2>&1 || true
   rm -f /tmp/pi-remote-tmux-config-error.$$
 
-  tmux source-file "$file" >/dev/null 2>&1 || true
+  if [[ "$file" == "$HOME/.tmux.conf" ]]; then
+    tmux source-file "$file" >/dev/null 2>&1 || true
+  fi
   printf 'Enhanced remote tmux config: %s\n' "$file" >/dev/tty 2>/dev/null || printf 'Enhanced remote tmux config: %s\n' "$file"
   printf 'Status help hint: %s\n' "$hint" >/dev/tty 2>/dev/null || printf 'Status help hint: %s\n' "$hint"
   if [[ -n "$backup" ]]; then
