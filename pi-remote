@@ -1,49 +1,54 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.8.2"
-# Literal remote-shell expression; expanded on LXS01, not on the Mac.
+VERSION="0.9.0"
+# Literal remote-shell expression; expanded on the remote host, not on the local machine.
 # shellcheck disable=SC2016
 REMOTE_PROJECT_PATH='"$HOME/projects/pi-remote/pi-remote"'
 DEFAULT_CONFIG_PATH="$HOME/.config/pi-remote/config"
+DEFAULT_HOST="pi-remote"
 
 usage() {
   cat <<'EOF'
-pi-remote - tiny SSH/tmux launcher for coding agents on LXS01
+pi-remote - tiny SSH/tmux launcher for coding agents on a remote host
 
 Usage:
-  pi-remote                                SSH to LXS01, arrow-pick/create a project, attach to an agent in tmux
+  pi-remote                                SSH to the configured host, pick/create a project, attach in tmux
   pi-remote --project NAME                 Start/attach for an existing ~/projects/NAME
   pi-remote --new NAME                     Create ~/projects/NAME, then start/attach
   pi-remote --agent pi|claude|codex        Choose the remote agent command (default: pi)
   pi-remote --project NAME --no-attach [-- AGENT_ARGS...]
   pi-remote --configure-tmux              Check/update remote tmux defaults, then exit
+  pi-remote --install-remote               Install/update the remote helper copy, then exit
+  pi-remote --init-config --host HOST       Create a local config file, then exit
   pi-remote --list
 
 Interactive menus use ↑/↓ or j/k, ←/→ to expand project sessions, and Enter.
 
 Options:
-  --host HOST             SSH host to use from the Mac (default: config host, PI_REMOTE_HOST, or LXS01)
+  --host HOST             SSH host to use (default: config host, PI_REMOTE_HOST, or pi-remote)
   --project NAME          Use an existing project under the remote project root
   --new NAME              Create/use a new project under the remote project root
   --session NAME          tmux session name (default: pi-remote-<project>)
   --agent NAME            Remote agent: pi, claude, codex, or custom (default from config/env: pi)
   --command COMMAND       Custom remote launch command; overrides --agent command lookup
   --no-attach             Create the tmux session detached and print the attach command
-  --configure-tmux       Ask to install/update pi-remote tmux defaults on LXS01 and exit
+  --configure-tmux       Ask to install/update pi-remote tmux defaults and exit
+  --install-remote       Install/update the remote helper copy and exit
+  --init-config          Create the local config file if missing and exit
   --skip-tmux-config     Do not prompt about remote tmux config during interactive startup
   --list                  List remote projects and exit
   --sessions PROJECT      List tmux sessions whose panes are in PROJECT and exit
   --dry-run               Print what would run without creating/attaching tmux
-  --project-root PATH     Remote project root (default on LXS01: ~/projects)
-  --pi-bin PATH           Pi executable on LXS01 (default: pi; backwards-compatible alias)
+  --project-root PATH     Remote project root (default: ~/projects)
+  --pi-bin PATH           Pi executable on the remote host (default: pi; backwards-compatible alias)
   --help                  Show this help
   --version               Show version
   --                      Everything after this is passed to the selected agent
 
 Config:
   ~/.config/pi-remote/config accepts simple key=value lines:
-    host=LXS01
+    host=pi-remote
     project_root=~/projects
     agent=pi
     pi_command=pi
@@ -53,15 +58,18 @@ Config:
 
 Environment:
   PI_REMOTE_HOST          Default SSH host.
+  PI_REMOTE_CONFIG        Local config path.
   PI_REMOTE_PROJECT_ROOT  Default remote project root for server mode.
   PI_REMOTE_AGENT         Default agent for server mode.
   PI_REMOTE_LAUNCH_COMMAND Custom launch command for server mode.
   PI_REMOTE_PI_BIN        Default Pi executable for server mode.
+  PI_REMOTE_CLAUDE_BIN    Default Claude executable for server mode.
+  PI_REMOTE_CODEX_BIN     Default Codex executable for server mode.
   PI_REMOTE_TMUX_CONFIG   Remote tmux config path (default: ~/.tmux.conf).
   PI_REMOTE_TMUX_CONFIG_SOURCE Set to 0 to write/validate config without sourcing it.
 
-Subagent-friendly example:
-  pi-remote --project pi-remote --session pi-remote-agent --no-attach -- "Review this project"
+Automation-friendly example:
+  pi-remote --project my-project --session review-agent --no-attach -- "Review this project"
 EOF
 }
 
@@ -150,8 +158,12 @@ expand_home_path() {
 
 list_projects() {
   local root=$1
+  local path
   mkdir -p "$root"
-  find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort
+  find "$root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
+    while IFS= read -r path; do
+      basename "$path"
+    done | sort
 }
 
 tmux_config_file() {
@@ -527,8 +539,9 @@ arrow_select() {
       k|K) selected=$((selected - 1)); redraw=1 ;;
       j|J) selected=$((selected + 1)); redraw=1 ;;
       q|Q)
-        selected=$((count - 1))
-        break
+        stty "$old_stty" < /dev/tty
+        printf '\033[?25h\n' >/dev/tty
+        return 1
         ;;
       ""|$'\n'|$'\r')
         break
@@ -794,7 +807,10 @@ pick_resume_session_menu() {
   local session choice_index
 
   [[ -r /dev/tty ]] || return 1
-  mapfile -t sessions < <(list_project_sessions "$project_dir")
+  while IFS= read -r session; do
+    [[ -n "$session" ]] || continue
+    sessions+=("$session")
+  done < <(list_project_sessions "$project_dir")
   (( ${#sessions[@]} > 0 )) || return 1
 
   for session in "${sessions[@]}"; do
@@ -1065,7 +1081,7 @@ run_server() {
   if session_exists "$session_name"; then
     if (( no_attach )); then
       printf 'tmux session already exists: %s\n' "$session_name"
-      printf 'attach with: ssh %s -t %s\n' "${PI_REMOTE_HOST:-LXS01}" "$(shell_join tmux attach -t "$session_name")"
+      printf 'attach with: ssh %s -t %s\n' "${PI_REMOTE_HOST:-$DEFAULT_HOST}" "$(shell_join tmux attach -t "$session_name")"
       exit 0
     fi
     exec tmux attach -t "$session_name"
@@ -1076,7 +1092,7 @@ run_server() {
     printf 'started detached tmux session: %s\n' "$session_name"
     printf 'project: %s\n' "$project_dir"
     printf 'agent: %s\n' "$agent"
-    printf 'attach with: ssh %s -t %s\n' "${PI_REMOTE_HOST:-LXS01}" "$(shell_join tmux attach -t "$session_name")"
+    printf 'attach with: ssh %s -t %s\n' "${PI_REMOTE_HOST:-$DEFAULT_HOST}" "$(shell_join tmux attach -t "$session_name")"
     exit 0
   fi
 
@@ -1116,7 +1132,7 @@ EOF
 run_local() {
   local config_host
   config_host=$(config_get host "")
-  local host=${PI_REMOTE_HOST:-${config_host:-LXS01}}
+  local host=${PI_REMOTE_HOST:-${config_host:-$DEFAULT_HOST}}
   local install=0
   local init_config=0
   local server_args=()
@@ -1206,7 +1222,7 @@ run_local() {
   fi
 
   if (( needs_tty )) && [[ ! -t 0 ]]; then
-    fail "this mode needs a TTY for the menu/tmux attach; use --project/--new with --no-attach from a subagent"
+    fail "this mode needs a TTY for the menu/tmux attach; use --project/--new with --no-attach from automation"
   fi
 
   local quoted_args=""
@@ -1220,7 +1236,7 @@ run_local() {
   local quoted_host
   quoted_host=$(shell_quote "$host")
   local remote_cmd
-  remote_cmd="if [[ ! -x $REMOTE_PROJECT_PATH ]]; then printf 'pi-remote is not installed on LXS01 at %s\\n' $REMOTE_PROJECT_PATH >&2; exit 127; fi; export PI_REMOTE_HOST=$quoted_host; exec $REMOTE_PROJECT_PATH --server$quoted_args"
+  remote_cmd="if [[ ! -x $REMOTE_PROJECT_PATH ]]; then printf 'pi-remote is not installed on the remote host at %s\\n' $REMOTE_PROJECT_PATH >&2; exit 127; fi; export PI_REMOTE_HOST=$quoted_host; exec $REMOTE_PROJECT_PATH --server$quoted_args"
   local remote_cmd_quoted
   remote_cmd_quoted=$(shell_quote "$remote_cmd")
 

@@ -1,50 +1,55 @@
 # pi-remote
 
-A deliberately tiny launcher for running a coding-agent CLI on LXS01.
+`pi-remote` is a small Bash launcher for remote coding-agent sessions. It SSHes to a configured host, lets you pick or create a project under a remote project root, and starts or resumes a `tmux` session running your chosen agent CLI.
 
-Default flow:
+It is intentionally dependency-light: local OpenSSH, remote Bash, remote `tmux`, and whichever agent command you want to run (`pi`, `claude`, `codex`, or a custom command).
 
-1. SSH from the MacBook into LXS01 (`LXS01`/`lxs01` alias the existing `lxso1` SSH config).
-2. Show folders in `~/projects` as an arrow-key menu, sorted by recent use, then active tmux session count, then name.
-3. Show a session count beside every project, e.g. `pi-remote (2)`.
-4. Press `←` or `→` on a project to expand/collapse its current tmux sessions inline.
-5. Press Enter on a session row to resume it, or Enter on a project row to start a new session.
+## Install
 
-The default agent is `pi`, but `claude` and `codex` are supported too.
+Put the script on your local `PATH`:
 
-## Install locations
+```bash
+install -m 0755 pi-remote ~/.local/bin/pi-remote
+```
 
-- Source on LXS01: `~/projects/pi-remote/pi-remote`
-- Remote convenience symlink: `~/.local/bin/pi-remote`
-- MacBook install: `~/.local/bin/pi-remote`
-- Local config: `~/.config/pi-remote/config`
+Create a local config for your SSH host:
+
+```bash
+pi-remote --init-config --host my-remote
+```
+
+Install or update the helper copy on the remote host:
+
+```bash
+pi-remote --install-remote
+```
+
+The remote helper is installed at `~/projects/pi-remote/pi-remote` and linked to `~/.local/bin/pi-remote` on the remote host.
 
 ## Usage
 
 ```bash
 pi-remote
-pi-remote --project pi-remote
+pi-remote --project my-project
 pi-remote --new my-project
 pi-remote --agent claude --project my-project
 pi-remote --agent codex --project my-project
-pi-remote --project pi-remote --session pi-remote-agent --no-attach -- "Review this project"
+pi-remote --project my-project --session review-agent --no-attach -- "Review this project"
 pi-remote --configure-tmux
 pi-remote --list
-pi-remote --sessions pi-remote
+pi-remote --sessions my-project
 ```
 
-With no switches, `pi-remote` opens an interactive menu: use ↑/↓ (or `j`/`k`) to move, `←`/`→` to expand a project and show its tmux sessions, and Enter to choose a project or session.
+With no switches, `pi-remote` opens an interactive menu. Use ↑/↓ or `j`/`k` to move, ←/→ to expand or collapse a project's current `tmux` sessions, and Enter to choose a project or session.
 
-On interactive startup, `pi-remote` checks whether the remote `~/.tmux.conf` has the recommended extended-key and bottom-bar help settings. If they are missing, it asks before appending/updating a small managed enhancement block; existing tmux config outside that block is preserved. The bottom-bar hint is generated from the actual tmux prefix and bindings, e.g. `help Ctrl+B?  detach Ctrl+B d  quit Ctrl+B x`. Use `pi-remote --configure-tmux` to force that check/prompt, or `--skip-tmux-config` to skip the startup check.
-
-Use `--no-attach` from non-interactive agents/subagents. It starts the tmux session detached and prints an attach command.
+Use `--no-attach` from non-interactive automation. It starts the `tmux` session detached and prints an attach command.
 
 ## Config
 
 `~/.config/pi-remote/config` accepts simple `key=value` lines:
 
 ```ini
-host=LXS01
+host=my-remote
 project_root=~/projects
 agent=pi
 pi_command=pi
@@ -55,14 +60,29 @@ codex_command=codex
 
 `launch_command` or `--command` overrides the agent command lookup.
 
-## Prior art checked
+Useful environment variables:
 
-Existing GitHub tools overlap with pieces of this:
+```text
+PI_REMOTE_HOST             Default SSH host.
+PI_REMOTE_CONFIG           Local config path.
+PI_REMOTE_PROJECT_ROOT     Remote project root for server mode.
+PI_REMOTE_AGENT            Default agent for server mode.
+PI_REMOTE_LAUNCH_COMMAND   Custom launch command for server mode.
+PI_REMOTE_PI_BIN           Pi executable for server mode.
+PI_REMOTE_CLAUDE_BIN       Claude executable for server mode.
+PI_REMOTE_CODEX_BIN        Codex executable for server mode.
+PI_REMOTE_TMUX_CONFIG      Remote tmux config path (default: ~/.tmux.conf).
+PI_REMOTE_TMUX_CONFIG_SOURCE Set to 0 to write/validate tmux config without sourcing it.
+```
 
-- `hex/claude-tmux`: Claude Code remote SSH panes in tmux.
-- `any-context/lazyclaude`: Claude Code tmux TUI with SSH remote sessions.
-- `cv/pi-ssh-remote` / `hjanuschka/pi-ssh`: Pi-local, tools-remote SSH workflows.
-- `indigoviolet/pi-tmux`: Pi extension for project tmux sessions.
-- `standardagents/dmux`, `0dragosh/cwt`, `smtg-ai/claude-squad`: broader tmux/worktree multi-agent managers.
+## Tmux config helper
 
-Those are broader than needed here. This script stays dependency-light: Bash, SSH, tmux, and whichever agent CLI you choose.
+On interactive startup, `pi-remote` checks whether the remote `~/.tmux.conf` has the recommended extended-key and bottom-bar help settings. If they are missing, it asks before appending or updating a small managed block. Existing tmux config outside that block is preserved.
+
+The bottom-bar hint is generated from the actual tmux prefix and bindings, for example:
+
+```text
+help Ctrl+B?  detach Ctrl+B d  quit Ctrl+B x
+```
+
+Use `pi-remote --configure-tmux` to force the check, or `--skip-tmux-config` to skip it for a run.
