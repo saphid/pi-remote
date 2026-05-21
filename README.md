@@ -1,5 +1,7 @@
 # pi-remote
 
+![pi-remote banner](assets/readme-banner.png)
+
 `pi-remote` is a small Bash launcher for remote coding-agent sessions. It SSHes to a configured host, lets you pick or create a project under a remote project root, and starts or resumes a `tmux` session running your chosen agent CLI.
 
 It is intentionally dependency-light: local OpenSSH, remote Bash, remote `tmux`, and whichever agent command you want to run (`pi`, `claude`, `codex`, or a custom command).
