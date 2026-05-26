@@ -58,13 +58,23 @@ pi-remote --agent claude --project my-project
 pi-remote --agent codex --project my-project
 pi-remote --project my-project --session review-agent --no-attach -- "Review this project"
 pi-remote --configure-tmux
+pi-remote --saved-sessions
+pi-remote --saved-sessions --agent codex
+pi-remote --saved-sessions --saved-agent pi --list
+pi-remote --host local --saved-sessions  # saved sessions on this machine
 pi-remote --list
 pi-remote --sessions my-project
 ```
 
-With no switches, `pi-remote` opens an interactive menu. Use ↑/↓ or `j`/`k` to move, ←/→ to expand or collapse a project's current `tmux` sessions, and Enter to choose a project or session.
+With no switches, `pi-remote` opens an interactive project menu. Active `tmux` sessions and saved Pi/Codex sessions whose working directory is under a project are nested under that project's folder row. Use ↑/↓ or `j`/`k` to move, ←/→ to expand or collapse a project, and Enter to choose a project, active session, or saved session.
+
+`--saved-sessions` opens the same KittyLitter-style picker over persisted Pi/Codex sessions (`~/.pi/agent/sessions` and `~/.codex/sessions`) on the target host without showing projects. Selecting a saved session starts a deterministic tmux session such as `pi-remote-pi-019e...` and re-attaches that tmux session on later launches instead of starting a second agent process for the same saved session. `--kittylitter` is an alias.
 
 Use `--no-attach` from non-interactive automation. It starts the `tmux` session detached and prints an attach command. The same options are available through `pi-remote` and `pi-remote.sh`.
+
+### Saved-session concurrency
+
+For saved Pi/Codex sessions, `pi-remote` uses a deterministic tmux session name based on the saved session id. Opening the same saved session again re-attaches that tmux session instead of launching another agent process. This avoids two live Pi/Codex processes writing to the same JSONL rollout/session file.
 
 ## Config
 

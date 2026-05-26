@@ -21,11 +21,13 @@ Usage:
   pi-remote.sh --agent pi|claude|codex      Choose the remote agent command (default: pi)
   pi-remote.sh --project NAME --no-attach [-- AGENT_ARGS...]
   pi-remote.sh --configure-tmux            Check/update remote tmux defaults, then exit
+  pi-remote.sh --saved-sessions             Pick a saved Pi/Codex session and attach in tmux
+  pi-remote.sh --saved-sessions --agent codex --list
   pi-remote.sh --install-remote             Install/update the remote helper copy, then exit
   pi-remote.sh --init-config --host HOST     Create a local config file, then exit
   pi-remote.sh --list
 
-Interactive menus use ↑/↓ or j/k, ←/→ to expand project sessions, and Enter.
+Interactive menus use ↑/↓ or j/k, ←/→ to expand projects, and Enter.
 
 Options:
   --host HOST             SSH host to use (default: config host, PI_REMOTE_HOST, or pi-remote)
@@ -41,6 +43,10 @@ Options:
   --skip-tmux-config     Do not prompt about remote tmux config during interactive startup
   --list                  List remote projects and exit
   --sessions PROJECT      List tmux sessions whose panes are in PROJECT and exit
+  --saved-sessions        Pick/list saved Pi/Codex JSONL sessions instead of projects
+  --kittylitter           Alias for --saved-sessions
+  --saved-agent NAME      Saved-session filter: all, pi, or codex (default: all)
+  --saved-session-limit N Saved-session scan/list cap (default: 120)
   --dry-run               Print what would run without creating/attaching tmux
   --project-root PATH     Remote project root (default: ~/projects)
   --pi-bin PATH           Pi executable on the remote host (default: pi; backwards-compatible alias)
@@ -136,6 +142,23 @@ shell_join() {
     fi
     shell_quote "$arg"
   done
+}
+
+is_local_host() {
+  case "${1-}" in
+    local|localhost|127.0.0.1|.) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+attach_command() {
+  local session_name=$1
+  local host=${PI_REMOTE_HOST:-$DEFAULT_HOST}
+  if is_local_host "$host"; then
+    shell_join tmux attach -t "$session_name"
+  else
+    printf 'ssh %s -t %s' "$(shell_quote "$host")" "$(shell_join tmux attach -t "$session_name")"
+  fi
 }
 
 sanitize_name() {
@@ -398,25 +421,44 @@ recent_file() {
   printf '%s\n' "${PI_REMOTE_RECENTS:-$HOME/.cache/pi-remote/recents.tsv}"
 }
 
-project_session_counts() {
-  local root=$1
+without_trailing_slashes() {
+  local value=$1
+  while [[ "$value" != "/" && "$value" == */ ]]; do
+    value=${value%/}
+  done
+  [[ -n "$value" ]] || value="/"
+  printf '%s\n' "$value"
+}
+
+child_path_prefix() {
+  local normalized
+  normalized=$(without_trailing_slashes "$1")
+  if [[ "$normalized" == "/" ]]; then
+    printf '/\n'
+  else
+    printf '%s/\n' "$normalized"
+  fi
+}
+
+project_sessions_by_project() {
+  local root=$1 prefix
   command -v tmux >/dev/null 2>&1 || return 0
-  tmux list-panes -a -F '#{session_name}	#{pane_current_path}	#{pane_current_command}' 2>/dev/null |
-    awk -F '\t' -v root="$root/" '
+  prefix=$(child_path_prefix "$root")
+  { tmux list-panes -a -F '#{session_name}	#{pane_current_path}	#{pane_current_command}' 2>/dev/null || true; } |
+    awk -F '\t' -v root="$prefix" '
       index($2, root) == 1 {
         rest = substr($2, length(root) + 1)
         split(rest, parts, "/")
         project = parts[1]
-        if (project != "") seen[project SUBSEP $1] = 1
+        if (project != "" && !seen[project SUBSEP $1]++) print project "\t" $1
       }
-      END {
-        for (key in seen) {
-          split(key, parts, SUBSEP)
-          counts[parts[1]]++
-        }
-        for (project in counts) print project "\t" counts[project]
-      }
-    '
+    ' | sort -t $'\t' -k1,1 -k2,2
+}
+
+project_session_counts() {
+  local root=$1
+  project_sessions_by_project "$root" |
+    awk -F '\t' '{ counts[$1]++ } END { for (project in counts) print project "\t" counts[project] }'
 }
 
 project_recent_times() {
@@ -436,25 +478,41 @@ project_recent_times() {
 
 project_menu_rows() {
   local root=$1
-  local projects_tmp counts_tmp recents_tmp
+  local saved_summary_file=${2:-}
+  local counts_file=${3:-}
+  local projects_tmp counts_tmp recents_tmp empty_saved_tmp=0 empty_counts_tmp=0
   projects_tmp=$(mktemp)
-  counts_tmp=$(mktemp)
   recents_tmp=$(mktemp)
+  if [[ -z "$counts_file" || ! -r "$counts_file" ]]; then
+    counts_tmp=$(mktemp)
+    empty_counts_tmp=1
+    project_session_counts "$root" >"$counts_tmp"
+  else
+    counts_tmp=$counts_file
+  fi
+  if [[ -z "$saved_summary_file" || ! -r "$saved_summary_file" ]]; then
+    saved_summary_file=$(mktemp)
+    empty_saved_tmp=1
+  fi
   list_projects "$root" >"$projects_tmp"
-  project_session_counts "$root" >"$counts_tmp"
   project_recent_times "$root" >"$recents_tmp"
   awk -F '\t' '
     FILENAME == ARGV[1] { projects[$1] = 1; order[++n] = $1; next }
     FILENAME == ARGV[2] { counts[$1] = $2 + 0; next }
     FILENAME == ARGV[3] { recents[$1] = $2 + 0; next }
+    FILENAME == ARGV[4] { saved_counts[$1] = $2 + 0; saved_recent[$1] = $3 + 0; next }
     END {
       for (i = 1; i <= n; i++) {
         project = order[i]
-        print project "\t" (counts[project] + 0) "\t" (recents[project] + 0)
+        recent = recents[project] + 0
+        if ((saved_recent[project] + 0) > recent) recent = saved_recent[project] + 0
+        print project "\t" (counts[project] + 0) "\t" (saved_counts[project] + 0) "\t" recent
       }
     }
-  ' "$projects_tmp" "$counts_tmp" "$recents_tmp" | sort -t $'\t' -k3,3nr -k2,2nr -k1,1
-  rm -f "$projects_tmp" "$counts_tmp" "$recents_tmp"
+  ' "$projects_tmp" "$counts_tmp" "$recents_tmp" "$saved_summary_file" | sort -t $'\t' -k4,4nr -k2,2nr -k3,3nr -k1,1
+  rm -f "$projects_tmp" "$recents_tmp"
+  (( empty_counts_tmp )) && rm -f "$counts_tmp"
+  (( empty_saved_tmp )) && rm -f "$saved_summary_file"
 }
 
 record_recent_project() {
@@ -474,6 +532,463 @@ record_recent_project() {
   rm -f "$tmp"
 }
 
+list_saved_sessions() {
+  local filter=$1
+  local limit=$2
+  python3 - "$filter" "$limit" <<'PY'
+import json, os, re, sys
+from pathlib import Path
+
+filter_arg = sys.argv[1]
+limit = int(sys.argv[2])
+home = Path.home()
+SCAN_BYTES = 256 * 1024
+
+def scan_lines(path):
+    st = path.stat()
+    if st.st_size <= SCAN_BYTES:
+        return path.read_text(errors='replace').splitlines(), st
+    with path.open('rb') as f:
+        data = f.read(SCAN_BYTES)
+    text = data.decode('utf-8', 'replace')
+    last_newline = text.rfind('\n')
+    if last_newline >= 0:
+        text = text[:last_newline]
+    return text.splitlines(), st
+
+def newest(root):
+    if not root.exists():
+        return []
+    files = []
+    for path in root.rglob('*.jsonl'):
+        try:
+            files.append((path.stat().st_mtime, path))
+        except OSError:
+            pass
+    files.sort(reverse=True)
+    return [p for _, p in files[:limit]]
+
+def safe(line):
+    try:
+        v = json.loads(line)
+        return v if isinstance(v, dict) else None
+    except Exception:
+        return None
+
+def content_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                if isinstance(block.get('text'), str):
+                    parts.append(block['text'])
+                elif isinstance(block.get('input_text'), str):
+                    parts.append(block['input_text'])
+        return '\n'.join(parts)
+    return ''
+
+def clean(text):
+    text = re.sub(r'\s+', ' ', text or '').strip() or '(untitled)'
+    return text[:119].rstrip() + '…' if len(text) > 120 else text
+
+def emit(agent, modified, sid, path, cwd, title, model, created, count):
+    fields = [agent, str(int(modified * 1000)), sid, str(path), cwd, clean(title), model or '', created or '', str(count)]
+    print('\t'.join(f.replace('\t', ' ').replace('\r', ' ').replace('\n', ' ') for f in fields))
+
+def parse_pi(path):
+    header = None
+    name = ''
+    first_user = ''
+    model = ''
+    count = 0
+    try:
+        lines, st = scan_lines(path)
+        for i, line in enumerate(lines):
+            entry = safe(line)
+            if not entry:
+                continue
+            typ = entry.get('type')
+            if i == 0 and typ == 'session':
+                header = entry
+            elif typ == 'session_info' and isinstance(entry.get('name'), str):
+                name = entry['name'].strip()
+            elif typ == 'model_change':
+                model = '/'.join(str(x) for x in (entry.get('provider'), entry.get('modelId')) if x)
+            elif typ == 'message' and isinstance(entry.get('message'), dict):
+                msg = entry['message']
+                role = msg.get('role')
+                if role in ('user', 'assistant'):
+                    count += 1
+                if role == 'user' and not first_user:
+                    first_user = content_text(msg.get('content'))
+        if not header or not isinstance(header.get('id'), str):
+            return
+        emit('pi', st.st_mtime, header['id'], path, str(header.get('cwd') or home), name or first_user, model, str(header.get('timestamp') or ''), count)
+    except Exception:
+        return
+
+def bootstrap(text):
+    t = (text or '').strip()
+    return (not t) or t.startswith('# AGENTS.md instructions') or t.startswith('<environment_context>') or t.startswith('<permissions instructions>')
+
+def parse_codex(path):
+    sid = ''
+    cwd = str(home)
+    created = ''
+    first_user = ''
+    model = ''
+    count = 0
+    try:
+        lines, st = scan_lines(path)
+        for line in lines:
+            entry = safe(line)
+            if not entry:
+                continue
+            payload = entry.get('payload') if isinstance(entry.get('payload'), dict) else {}
+            typ = entry.get('type')
+            if typ == 'session_meta':
+                if payload.get('id'):
+                    sid = str(payload['id'])
+                cwd = str(payload.get('cwd') or cwd)
+                created = str(payload.get('timestamp') or entry.get('timestamp') or created or '')
+            elif typ == 'turn_context':
+                cwd = str(payload.get('cwd') or cwd)
+                if payload.get('model'):
+                    model = str(payload['model'])
+            elif typ == 'event_msg':
+                et = payload.get('type')
+                if et == 'user_message':
+                    count += 1
+                    msg = payload.get('message')
+                    if isinstance(msg, str) and not first_user and not bootstrap(msg):
+                        first_user = msg
+                elif isinstance(et, str) and et.startswith('agent_message'):
+                    count += 1
+            elif typ == 'response_item' and payload.get('type') == 'message':
+                if payload.get('role') in ('user', 'assistant'):
+                    count += 1
+                if payload.get('role') == 'user' and not first_user:
+                    text = content_text(payload.get('content'))
+                    if not bootstrap(text):
+                        first_user = text
+        if not sid:
+            m = re.search(r'([0-9a-f]{8}-[0-9a-f-]{27,})', path.stem)
+            sid = m.group(1) if m else path.stem
+        emit('codex', st.st_mtime, sid, path, cwd, first_user, model, created, count)
+    except Exception:
+        return
+
+if filter_arg in ('all', 'pi'):
+    for p in newest(home / '.pi' / 'agent' / 'sessions'):
+        parse_pi(p)
+if filter_arg in ('all', 'codex'):
+    for p in newest(home / '.codex' / 'sessions'):
+        parse_codex(p)
+PY
+}
+
+saved_sessions_for_project_menu() {
+  local root=$1
+  local filter=$2
+  local limit=$3
+  local sessions_tmp
+  sessions_tmp=$(mktemp)
+  list_saved_sessions "$filter" "$limit" >"$sessions_tmp"
+  python3 - "$root" "$sessions_tmp" <<'PY'
+import os, sys
+
+root = os.path.abspath(os.path.expanduser(sys.argv[1]))
+sessions_file = sys.argv[2]
+home = os.path.expanduser('~')
+try:
+    projects = {name for name in os.listdir(root) if os.path.isdir(os.path.join(root, name))}
+except OSError:
+    projects = set()
+
+try:
+    with open(sessions_file, encoding='utf-8', errors='replace') as source:
+        for raw in source:
+            line = raw.rstrip('\n')
+            if not line:
+                continue
+            fields = line.split('\t')
+            if len(fields) < 5:
+                continue
+            cwd = os.path.abspath(os.path.expanduser(fields[4] or home))
+            try:
+                rel = os.path.relpath(cwd, root)
+            except ValueError:
+                continue
+            if rel in ('', os.curdir) or rel == os.pardir or rel.startswith(os.pardir + os.sep):
+                continue
+            project = rel.split(os.sep, 1)[0]
+            if project not in projects:
+                continue
+            print(project + '\t' + line)
+except OSError:
+    pass
+PY
+  rm -f "$sessions_tmp"
+}
+
+saved_session_filter() {
+  local agent=$1
+  local explicit_agent=$2
+  local saved_agent=$3
+  if (( explicit_agent )) && [[ "$agent" == "pi" || "$agent" == "codex" ]]; then
+    printf '%s\n' "$agent"
+  else
+    printf '%s\n' "$saved_agent"
+  fi
+}
+
+saved_session_age() {
+  local modified_ms=$1
+  local now seconds
+  now=$(date +%s)
+  seconds=$((now - modified_ms / 1000))
+  (( seconds < 0 )) && seconds=0
+  if (( seconds < 3600 )); then printf '%sm' "$((seconds / 60))"
+  elif (( seconds < 86400 )); then printf '%sh' "$((seconds / 3600))"
+  elif (( seconds < 2592000 )); then printf '%sd' "$((seconds / 86400))"
+  else printf '%smo' "$((seconds / 2592000))"
+  fi
+}
+
+one_line() {
+  local text=${1-}
+  text=${text//$'\t'/ }
+  text=${text//$'\r'/ }
+  text=${text//$'\n'/ }
+  printf '%s' "$text"
+}
+
+clip_end() {
+  local text max
+  text=$(one_line "${1-}")
+  max=${2:-80}
+  (( max <= 0 )) && return 0
+  if (( ${#text} <= max )); then
+    printf '%s' "$text"
+  elif (( max == 1 )); then
+    printf '…'
+  else
+    printf '%s…' "${text:0:max-1}"
+  fi
+}
+
+clip_start() {
+  local text max
+  text=$(one_line "${1-}")
+  max=${2:-80}
+  (( max <= 0 )) && return 0
+  if (( ${#text} <= max )); then
+    printf '%s' "$text"
+  elif (( max == 1 )); then
+    printf '…'
+  else
+    printf '…%s' "${text: -$((max - 1))}"
+  fi
+}
+
+terminal_columns() {
+  local cols=${COLUMNS:-}
+  if [[ ! "$cols" =~ ^[0-9]+$ ]]; then
+    cols=$(tput cols 2>/dev/null || printf '80')
+  fi
+  [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+  (( cols < 20 )) && cols=20
+  printf '%s\n' "$cols"
+}
+
+menu_label_width() {
+  local cols
+  cols=$(terminal_columns)
+  cols=$((cols - 4))
+  (( cols < 40 )) && cols=40
+  printf '%s\n' "$cols"
+}
+
+fit_line() {
+  clip_end "${1-}" "${2:-80}"
+}
+
+saved_session_label() {
+  local agent=$1 modified=$2 sid=$3 _path=$4 cwd=$5 title=$6 _model=$7 max_width=${8:-112}
+  local age short cwd_short prefix suffix available cwd_width title_width title_short cwd_render rendered
+  (( max_width < 40 )) && max_width=40
+  age=$(saved_session_age "$modified")
+  short=${sid:0:12}
+  if [[ "$cwd" == "$HOME" ]]; then
+    cwd_short='~'
+  elif [[ "$cwd" == "$HOME/"* ]]; then
+    cwd_short="~/${cwd#"$HOME/"}"
+  else
+    cwd_short=$cwd
+  fi
+  prefix=$(printf '%-5s %5s  ' "$agent" "$age")
+  suffix="  $short"
+  available=$((max_width - ${#prefix} - ${#suffix} - 2))
+
+  if (( available < 34 )); then
+    title_width=$((max_width - ${#prefix} - ${#suffix}))
+    (( title_width < 8 )) && title_width=8
+    title_short=$(clip_end "$title" "$title_width")
+    fit_line "${prefix}${title_short}${suffix}" "$max_width"
+    return 0
+  fi
+
+  cwd_width=$((available / 3))
+  (( cwd_width < 14 )) && cwd_width=14
+  (( cwd_width > 34 )) && cwd_width=34
+  title_width=$((available - cwd_width - 2))
+  if (( title_width < 18 )); then
+    title_width=18
+    cwd_width=$((available - title_width - 2))
+    (( cwd_width < 8 )) && cwd_width=8
+  fi
+
+  title_short=$(clip_end "$title" "$title_width")
+  cwd_render=$(clip_start "$cwd_short" "$cwd_width")
+  rendered=$(printf '%s%-*s  %-*s%s' "$prefix" "$title_width" "$title_short" "$cwd_width" "$cwd_render" "$suffix")
+  fit_line "$rendered" "$max_width"
+}
+
+print_saved_sessions() {
+  local index=1 row agent modified sid path_field cwd title model created count
+  while IFS=$'\t' read -r agent modified sid path_field cwd title model created count; do
+    [[ -n "$agent" ]] || continue
+    printf '%03d  ' "$index"
+    saved_session_label "$agent" "$modified" "$sid" "$path_field" "$cwd" "$title" "$model"
+    printf '\n'
+    index=$((index + 1))
+  done
+}
+
+resolve_saved_agent_command() {
+  local agent=$1
+  local explicit_command=$2
+  if [[ -n "$explicit_command" ]]; then
+    printf '%s\n' "$explicit_command"
+    return 0
+  fi
+  # Saved-session resumes need the selected agent's resume/session subcommand;
+  # launch_command is intentionally only used for generic project launches.
+  case "$agent" in
+    pi) printf '%s\n' "${PI_REMOTE_PI_BIN:-$(config_get pi_command "pi")}" ;;
+    codex) printf '%s\n' "${PI_REMOTE_CODEX_BIN:-$(config_get codex_command "codex")}" ;;
+    *) fail "saved sessions only support pi and codex" ;;
+  esac
+}
+
+saved_tmux_session_name() {
+  local agent=$1
+  local sid=$2
+  sanitize_name "pi-remote-$agent-$sid" | cut -c1-48
+}
+
+attach_saved_session_row() {
+  local row=$1
+  local explicit_command=$2
+  local session_name_override=$3
+  local no_attach=$4
+  local dry_run=$5
+  shift 5
+  local agent_args=("$@")
+  local agent modified sid path_field cwd title model created count
+  IFS=$'\t' read -r agent modified sid path_field cwd title model created count <<<"$row"
+  local launch_base agent_command tmux_session
+  if [[ -n "$session_name_override" ]]; then
+    tmux_session=$(sanitize_name "$session_name_override") || fail "empty tmux session name"
+  else
+    tmux_session=$(saved_tmux_session_name "$agent" "$sid")
+  fi
+
+  if session_exists "$tmux_session"; then
+    if (( no_attach || dry_run )); then
+      printf 'tmux session already exists: %s\n' "$tmux_session"
+      printf 'attach with: %s\n' "$(attach_command "$tmux_session")"
+      exit 0
+    fi
+    exec tmux attach -t "$tmux_session"
+  fi
+
+  launch_base=$(resolve_saved_agent_command "$agent" "$explicit_command")
+  check_launch_command_exists "$launch_base"
+  case "$agent" in
+    pi) agent_command="$launch_base --session $(shell_quote "$path_field")" ;;
+    codex) agent_command="$launch_base resume $(shell_quote "$sid")" ;;
+  esac
+  if [[ ${agent_args+x} ]]; then
+    agent_command+=" $(shell_join "${agent_args[@]}")"
+  fi
+
+  if (( dry_run )); then
+    printf 'host=%s\n' "$(hostname)"
+    printf 'saved_session=%s\n' "$path_field"
+    printf 'cwd=%s\n' "$cwd"
+    printf 'tmux_session=%s\n' "$tmux_session"
+    printf 'agent=%s\n' "$agent"
+    printf 'attach=%s\n' "$([[ $no_attach -eq 1 ]] && printf no || printf yes)"
+    printf 'command=%s\n' "$agent_command"
+    exit 0
+  fi
+
+  if (( no_attach )); then
+    tmux new-session -d -s "$tmux_session" -c "$cwd" "$agent_command"
+    printf 'started detached tmux session: %s\n' "$tmux_session"
+    printf 'cwd: %s\n' "$cwd"
+    printf 'agent: %s\n' "$agent"
+    printf 'attach with: %s\n' "$(attach_command "$tmux_session")"
+    exit 0
+  fi
+
+  exec tmux new-session -s "$tmux_session" -c "$cwd" "$agent_command"
+}
+
+run_saved_sessions() {
+  local filter=$1
+  local limit=$2
+  local explicit_command=$3
+  local session_name_override=$4
+  local no_attach=$5
+  local dry_run=$6
+  local do_list=$7
+  shift 7
+  local agent_args=("$@")
+  local rows=()
+  local scan_row
+  while IFS= read -r scan_row; do
+    [[ -n "$scan_row" ]] || continue
+    rows+=("$scan_row")
+  done < <(list_saved_sessions "$filter" "$limit" | sort -t $'\t' -k2,2nr | head -n "$limit")
+  if (( do_list )); then
+    if (( ${#rows[@]} > 0 )); then
+      printf '%s\n' "${rows[@]}" | print_saved_sessions
+    fi
+    exit 0
+  fi
+  (( ${#rows[@]} > 0 )) || fail "no saved sessions found for agent filter '$filter'"
+  [[ -r /dev/tty ]] || fail "interactive saved-session menu needs a TTY; pass --list for non-interactive use"
+  local labels=() row agent modified sid path_field cwd title model created count label_width
+  label_width=$(menu_label_width)
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r agent modified sid path_field cwd title model created count <<<"$row"
+    labels+=("$(saved_session_label "$agent" "$modified" "$sid" "$path_field" "$cwd" "$title" "$model" "$label_width")")
+  done
+  local choice
+  choice=$(arrow_select "Saved Pi/Codex sessions on $(hostname) (↑/↓ or j/k, Enter)" "${labels[@]}") || exit 0
+  if [[ ${agent_args+x} ]]; then
+    attach_saved_session_row "${rows[$choice]}" "$explicit_command" "$session_name_override" "$no_attach" "$dry_run" "${agent_args[@]}"
+  else
+    attach_saved_session_row "${rows[$choice]}" "$explicit_command" "$session_name_override" "$no_attach" "$dry_run"
+  fi
+}
+
 render_arrow_menu() {
   local prompt=$1
   local selected=$2
@@ -482,13 +997,19 @@ render_arrow_menu() {
   shift 4
   local items=("$@")
   local count=${#items[@]}
-  local row index label
+  local row index label cols line_width label_width status
 
-  printf '\r\033[K%s\n' "$prompt" >/dev/tty
+  cols=$(terminal_columns)
+  line_width=$((cols - 1))
+  label_width=$((cols - 3))
+  (( line_width < 1 )) && line_width=1
+  (( label_width < 1 )) && label_width=1
+
+  printf '\r\033[K%s\n' "$(fit_line "$prompt" "$line_width")" >/dev/tty
   for ((row = 0; row < visible; row += 1)); do
     index=$((offset + row))
     if (( index < count )); then
-      label=${items[$index]}
+      label=$(fit_line "${items[$index]}" "$label_width")
       if (( index == selected )); then
         printf '\033[K\033[7m› %s\033[0m\n' "$label" >/dev/tty
       else
@@ -498,7 +1019,8 @@ render_arrow_menu() {
       printf '\033[K\n' >/dev/tty
     fi
   done
-  printf '\033[K[%d/%d] ↑/↓ or j/k, Enter\n' "$((selected + 1))" "$count" >/dev/tty
+  status=$(printf '[%d/%d] ↑/↓ or j/k, Enter' "$((selected + 1))" "$count")
+  printf '\033[K%s\n' "$(fit_line "$status" "$line_width")" >/dev/tty
 }
 
 arrow_select() {
@@ -582,18 +1104,28 @@ project_dir_from_arg() {
 }
 
 list_project_sessions() {
-  local project_dir=$1
+  local project_dir=$1 normalized prefix
   command -v tmux >/dev/null 2>&1 || return 0
-  tmux list-panes -a -F '#{session_name}	#{pane_current_path}	#{pane_current_command}' 2>/dev/null |
-    awk -F '\t' -v project="$project_dir" '
-      $2 == project || index($2, project "/") == 1 { if (!seen[$1]++) print $1 }
+  normalized=$(without_trailing_slashes "$project_dir")
+  prefix=$(child_path_prefix "$project_dir")
+  { tmux list-panes -a -F '#{session_name}	#{pane_current_path}	#{pane_current_command}' 2>/dev/null || true; } |
+    awk -F '\t' -v project="$normalized" -v prefix="$prefix" '
+      $2 == project || index($2, prefix) == 1 { if (!seen[$1]++) print $1 }
     ' | sort
 }
 
 MENU_TYPES=()
 MENU_PROJECTS=()
 MENU_SESSIONS=()
+MENU_SAVED_ROWS=()
 MENU_LABELS=()
+MENU_EXPANDABLE=()
+MENU_EXPANDED=()
+PROJECT_MENU_ACTIVE_TREE_FILE=""
+PROJECT_MENU_ACTIVE_SUMMARY_FILE=""
+PROJECT_MENU_SAVED_TREE_FILE=""
+PROJECT_MENU_SAVED_SUMMARY_FILE=""
+PROJECT_MENU_PROJECT_ROWS_FILE=""
 
 expanded_contains() {
   local expanded=$1
@@ -601,49 +1133,155 @@ expanded_contains() {
   [[ "$expanded" == *"|$project|"* ]]
 }
 
+project_session_summary() {
+  local active_count=$1
+  local saved_count=$2
+  if (( active_count > 0 && saved_count > 0 )); then
+    printf '%s active, %s saved' "$active_count" "$saved_count"
+  elif (( active_count > 0 )); then
+    printf '%s active' "$active_count"
+  elif (( saved_count > 0 )); then
+    printf '%s saved' "$saved_count"
+  else
+    printf '0'
+  fi
+}
+
+cleanup_project_tree_snapshot() {
+  [[ -n "$PROJECT_MENU_ACTIVE_TREE_FILE" ]] && rm -f "$PROJECT_MENU_ACTIVE_TREE_FILE"
+  [[ -n "$PROJECT_MENU_ACTIVE_SUMMARY_FILE" ]] && rm -f "$PROJECT_MENU_ACTIVE_SUMMARY_FILE"
+  [[ -n "$PROJECT_MENU_SAVED_TREE_FILE" ]] && rm -f "$PROJECT_MENU_SAVED_TREE_FILE"
+  [[ -n "$PROJECT_MENU_SAVED_SUMMARY_FILE" ]] && rm -f "$PROJECT_MENU_SAVED_SUMMARY_FILE"
+  [[ -n "$PROJECT_MENU_PROJECT_ROWS_FILE" ]] && rm -f "$PROJECT_MENU_PROJECT_ROWS_FILE"
+  PROJECT_MENU_ACTIVE_TREE_FILE=""
+  PROJECT_MENU_ACTIVE_SUMMARY_FILE=""
+  PROJECT_MENU_SAVED_TREE_FILE=""
+  PROJECT_MENU_SAVED_SUMMARY_FILE=""
+  PROJECT_MENU_PROJECT_ROWS_FILE=""
+}
+
+build_project_tree_snapshot() {
+  local root=$1
+  local saved_filter=${2:-all}
+  local saved_limit=${3:-120}
+  cleanup_project_tree_snapshot
+  PROJECT_MENU_ACTIVE_TREE_FILE=$(mktemp)
+  PROJECT_MENU_ACTIVE_SUMMARY_FILE=$(mktemp)
+  PROJECT_MENU_SAVED_TREE_FILE=$(mktemp)
+  PROJECT_MENU_SAVED_SUMMARY_FILE=$(mktemp)
+  PROJECT_MENU_PROJECT_ROWS_FILE=$(mktemp)
+
+  project_sessions_by_project "$root" >"$PROJECT_MENU_ACTIVE_TREE_FILE"
+  awk -F '\t' '{ count[$1]++ } END { for (project in count) print project "\t" count[project] }' "$PROJECT_MENU_ACTIVE_TREE_FILE" >"$PROJECT_MENU_ACTIVE_SUMMARY_FILE"
+
+  saved_sessions_for_project_menu "$root" "$saved_filter" "$saved_limit" | sort -t $'\t' -k1,1 -k3,3nr >"$PROJECT_MENU_SAVED_TREE_FILE"
+  awk -F '\t' '
+    NF >= 3 {
+      count[$1]++
+      recent = int(($3 + 0) / 1000)
+      if (recent > recents[$1]) recents[$1] = recent
+    }
+    END { for (project in count) print project "\t" count[project] "\t" (recents[project] + 0) }
+  ' "$PROJECT_MENU_SAVED_TREE_FILE" >"$PROJECT_MENU_SAVED_SUMMARY_FILE"
+
+  project_menu_rows "$root" "$PROJECT_MENU_SAVED_SUMMARY_FILE" "$PROJECT_MENU_ACTIVE_SUMMARY_FILE" >"$PROJECT_MENU_PROJECT_ROWS_FILE"
+}
+
 build_project_tree_rows() {
   local root=$1
   local expanded=$2
-  local project count _recent session
+  local saved_filter=${3:-all}
+  local saved_limit=${4:-120}
+  local project count saved_count _recent total_count session saved_row agent modified sid path_field cwd title model created msg_count
+  local saved_label_width cleanup_after=0 expandable is_expanded
   MENU_TYPES=()
   MENU_PROJECTS=()
   MENU_SESSIONS=()
+  MENU_SAVED_ROWS=()
   MENU_LABELS=()
+  MENU_EXPANDABLE=()
+  MENU_EXPANDED=()
 
-  while IFS=$'\t' read -r project count _recent; do
+  if [[ -z "$PROJECT_MENU_PROJECT_ROWS_FILE" || ! -r "$PROJECT_MENU_PROJECT_ROWS_FILE" ]]; then
+    build_project_tree_snapshot "$root" "$saved_filter" "$saved_limit"
+    cleanup_after=1
+  fi
+
+  saved_label_width=$(menu_label_width)
+  saved_label_width=$((saved_label_width - 6))
+  (( saved_label_width < 36 )) && saved_label_width=36
+
+  while IFS=$'\t' read -r project count saved_count _recent; do
     [[ -n "$project" ]] || continue
+    count=${count:-0}
+    saved_count=${saved_count:-0}
+    total_count=$((count + saved_count))
+    expandable=0
+    is_expanded=0
+    if (( total_count > 0 )); then
+      expandable=1
+      if expanded_contains "$expanded" "$project"; then
+        is_expanded=1
+      fi
+    fi
     MENU_TYPES+=("project")
     MENU_PROJECTS+=("$project")
     MENU_SESSIONS+=("")
-    if (( count > 0 )); then
-      if expanded_contains "$expanded" "$project"; then
-        MENU_LABELS+=("▾ $project ($count)")
+    MENU_SAVED_ROWS+=("")
+    MENU_EXPANDABLE+=("$expandable")
+    MENU_EXPANDED+=("$is_expanded")
+    if (( total_count > 0 )); then
+      if (( is_expanded )); then
+        MENU_LABELS+=("▾ $project ($(project_session_summary "$count" "$saved_count"))")
       else
-        MENU_LABELS+=("▸ $project ($count)")
+        MENU_LABELS+=("▸ $project ($(project_session_summary "$count" "$saved_count"))")
       fi
     else
       MENU_LABELS+=("  $project (0)")
     fi
 
-    if (( count > 0 )) && expanded_contains "$expanded" "$project"; then
+    if (( is_expanded )); then
       while IFS= read -r session; do
         [[ -n "$session" ]] || continue
         MENU_TYPES+=("session")
         MENU_PROJECTS+=("$project")
         MENU_SESSIONS+=("$session")
-        MENU_LABELS+=("    ↳ $session")
-      done < <(list_project_sessions "$root/$project")
+        MENU_SAVED_ROWS+=("")
+        MENU_EXPANDABLE+=("0")
+        MENU_EXPANDED+=("0")
+        MENU_LABELS+=("    ● $session")
+      done < <(awk -F '\t' -v project="$project" '$1 == project { print $2 }' "$PROJECT_MENU_ACTIVE_TREE_FILE")
+
+      while IFS=$'\t' read -r agent modified sid path_field cwd title model created msg_count; do
+        [[ -n "$agent" ]] || continue
+        saved_row=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$agent" "$modified" "$sid" "$path_field" "$cwd" "$title" "$model" "$created" "$msg_count")
+        MENU_TYPES+=("saved")
+        MENU_PROJECTS+=("$project")
+        MENU_SESSIONS+=("")
+        MENU_SAVED_ROWS+=("$saved_row")
+        MENU_EXPANDABLE+=("0")
+        MENU_EXPANDED+=("0")
+        MENU_LABELS+=("    ◷ $(saved_session_label "$agent" "$modified" "$sid" "$path_field" "$cwd" "$title" "$model" "$saved_label_width")")
+      done < <(awk -v project="$project" 'index($0, project "\t") == 1 { print substr($0, length(project) + 2) }' "$PROJECT_MENU_SAVED_TREE_FILE")
     fi
-  done < <(project_menu_rows "$root")
+  done <"$PROJECT_MENU_PROJECT_ROWS_FILE"
 
   MENU_TYPES+=("create")
   MENU_PROJECTS+=("")
   MENU_SESSIONS+=("")
+  MENU_SAVED_ROWS+=("")
+  MENU_EXPANDABLE+=("0")
+  MENU_EXPANDED+=("0")
   MENU_LABELS+=("Create a new project")
   MENU_TYPES+=("quit")
   MENU_PROJECTS+=("")
   MENU_SESSIONS+=("")
+  MENU_SAVED_ROWS+=("")
+  MENU_EXPANDABLE+=("0")
+  MENU_EXPANDED+=("0")
   MENU_LABELS+=("Quit")
+
+  (( cleanup_after )) && cleanup_project_tree_snapshot
 }
 
 find_project_row_index() {
@@ -658,19 +1296,68 @@ find_project_row_index() {
   printf '0\n'
 }
 
+project_tree_row_label() {
+  local index=$1
+  local selected=$2
+  local label=${MENU_LABELS[$index]}
+  local project_label trimmed
+  if (( ! selected )) || [[ "${MENU_TYPES[$index]}" != "project" ]]; then
+    printf '%s' "$label"
+    return 0
+  fi
+  if (( ${MENU_EXPANDABLE[$index]:-0} )); then
+    project_label=${label#▸ }
+    project_label=${project_label#▾ }
+    if (( ${MENU_EXPANDED[$index]:-0} )); then
+      printf '▾ ← collapse · Enter=new  %s' "$project_label"
+    else
+      printf '▸ → expand · Enter=new  %s' "$project_label"
+    fi
+    return 0
+  fi
+  trimmed=${label# }
+  trimmed=${trimmed# }
+  printf 'Enter=new  %s' "$trimmed"
+}
+
+project_tree_footer() {
+  local selected=$1
+  local count=$2
+  local position current_type
+  position=$(printf '[%d/%d]' "$((selected + 1))" "$count")
+  current_type=${MENU_TYPES[$selected]:-}
+  if [[ "$current_type" == "project" ]]; then
+    if (( ${MENU_EXPANDABLE[$selected]:-0} )); then
+      printf '%s ↑/↓ move  ←/→ expand/collapse  Enter new session' "$position"
+    else
+      printf '%s ↑/↓ move  Enter new session' "$position"
+    fi
+  elif [[ "$current_type" == "session" || "$current_type" == "saved" ]]; then
+    printf '%s ↑/↓ move  Enter resume  ←/→ collapse project' "$position"
+  else
+    printf '%s ↑/↓ move  Enter select' "$position"
+  fi
+}
+
 render_project_tree_menu() {
   local prompt=$1
   local selected=$2
   local offset=$3
   local visible=$4
   local count=${#MENU_LABELS[@]}
-  local row index label
+  local row index label cols line_width label_width status
 
-  printf '\r\033[K%s\n' "$prompt" >/dev/tty
+  cols=$(terminal_columns)
+  line_width=$((cols - 1))
+  label_width=$((cols - 3))
+  (( line_width < 1 )) && line_width=1
+  (( label_width < 1 )) && label_width=1
+
+  printf '\r\033[K%s\n' "$(fit_line "$prompt" "$line_width")" >/dev/tty
   for ((row = 0; row < visible; row += 1)); do
     index=$((offset + row))
     if (( index < count )); then
-      label=${MENU_LABELS[$index]}
+      label=$(fit_line "$(project_tree_row_label "$index" "$((index == selected))")" "$label_width")
       if (( index == selected )); then
         printf '\033[K\033[7m› %s\033[0m\n' "$label" >/dev/tty
       else
@@ -680,29 +1367,32 @@ render_project_tree_menu() {
       printf '\033[K\n' >/dev/tty
     fi
   done
-  printf '\033[K[%d/%d] ↑/↓ move  ←/→ expand sessions  Enter select\n' "$((selected + 1))" "$count" >/dev/tty
+  status=$(project_tree_footer "$selected" "$count")
+  printf '\033[K%s\n' "$(fit_line "$status" "$line_width")" >/dev/tty
 }
 
 pick_project_menu() {
   local root=$1
+  local saved_filter=${2:-all}
+  local saved_limit=${3:-120}
   local expanded="|"
   local selected=0
   local offset=0
   local terminal_rows visible lines count
-  local key rest old_stty redraw current_type current_project new_name safe_name selected_session
+  local key rest old_stty redraw current_type current_project current_saved new_name safe_name selected_session
 
   if [[ ! -r /dev/tty ]]; then
     fail "interactive project menu needs a TTY; pass --project NAME or --new NAME for non-interactive use"
   fi
 
-  build_project_tree_rows "$root" "$expanded"
+  build_project_tree_snapshot "$root" "$saved_filter" "$saved_limit"
+  build_project_tree_rows "$root" "$expanded" "$saved_filter" "$saved_limit"
   count=${#MENU_LABELS[@]}
   terminal_rows=$(tput lines 2>/dev/null || printf '24')
   [[ "$terminal_rows" =~ ^[0-9]+$ ]] || terminal_rows=24
   visible=$((terminal_rows - 4))
   (( visible < 5 )) && visible=5
   (( visible > 20 )) && visible=20
-  (( visible > count )) && visible=$count
   lines=$((visible + 2))
 
   old_stty=$(stty -g < /dev/tty)
@@ -722,17 +1412,16 @@ pick_project_menu() {
           '[D'|'OD'|'[C'|'OC')
             current_type=${MENU_TYPES[$selected]}
             current_project=${MENU_PROJECTS[$selected]}
-            if [[ "$current_type" == "project" || "$current_type" == "session" ]]; then
-              if [[ -n "$current_project" ]]; then
+            if [[ "$current_type" == "project" || "$current_type" == "session" || "$current_type" == "saved" ]]; then
+              if [[ -n "$current_project" && ( "$current_type" != "project" || ${MENU_EXPANDABLE[$selected]:-0} -eq 1 ) ]]; then
                 if expanded_contains "$expanded" "$current_project"; then
                   expanded=${expanded//|$current_project|/|}
                 else
                   expanded+="$current_project|"
                 fi
-                build_project_tree_rows "$root" "$expanded"
+                build_project_tree_rows "$root" "$expanded" "$saved_filter" "$saved_limit"
                 count=${#MENU_LABELS[@]}
                 selected=$(find_project_row_index "$current_project")
-                (( visible > count )) && visible=$count
                 redraw=1
               fi
             fi
@@ -744,6 +1433,7 @@ pick_project_menu() {
       q|Q)
         stty "$old_stty" < /dev/tty
         printf '\033[?25h\n' >/dev/tty
+        cleanup_project_tree_snapshot
         printf '__PI_REMOTE_QUIT__\t\n'
         return 0
         ;;
@@ -751,8 +1441,10 @@ pick_project_menu() {
         current_type=${MENU_TYPES[$selected]}
         current_project=${MENU_PROJECTS[$selected]}
         selected_session=${MENU_SESSIONS[$selected]}
+        current_saved=${MENU_SAVED_ROWS[$selected]}
         stty "$old_stty" < /dev/tty
         printf '\033[?25h\n' >/dev/tty
+        cleanup_project_tree_snapshot
         case "$current_type" in
           project)
             printf '%s\t\n' "$current_project"
@@ -760,6 +1452,10 @@ pick_project_menu() {
             ;;
           session)
             printf '%s\t%s\n' "$current_project" "$selected_session"
+            return 0
+            ;;
+          saved)
+            printf '__PI_REMOTE_SAVED__\t%s\n' "$current_saved"
             return 0
             ;;
           create)
@@ -799,6 +1495,7 @@ pick_project_menu() {
 
   stty "$old_stty" < /dev/tty
   printf '\033[?25h\n' >/dev/tty
+  cleanup_project_tree_snapshot
   exit 0
 }
 
@@ -905,9 +1602,13 @@ run_server() {
   local configure_tmux=0
   local skip_tmux_config=0
   local sessions_project=""
+  local saved_sessions=0
+  local saved_session_limit=120
+  local saved_agent="all"
   local selected_session=""
   local project_was_interactive=0
   local agent=${PI_REMOTE_AGENT:-${configured_agent:-pi}}
+  local explicit_agent=0
   local explicit_command=""
   local agent_args=()
   local arg
@@ -941,9 +1642,23 @@ run_server() {
       --agent)
         (($#)) || fail "--agent requires a value"
         agent=$1
+        explicit_agent=1
         shift
         ;;
-      --agent=*) agent=${arg#--agent=} ;;
+      --agent=*) agent=${arg#--agent=}; explicit_agent=1 ;;
+      --saved-agent)
+        (($#)) || fail "--saved-agent requires all, pi, or codex"
+        saved_agent=$1
+        shift
+        ;;
+      --saved-agent=*) saved_agent=${arg#--saved-agent=} ;;
+      --saved-session-limit)
+        (($#)) || fail "--saved-session-limit requires a number"
+        saved_session_limit=$1
+        shift
+        ;;
+      --saved-session-limit=*) saved_session_limit=${arg#--saved-session-limit=} ;;
+      --saved-sessions|--kittylitter) saved_sessions=1 ;;
       --command)
         (($#)) || fail "--command requires a shell command"
         explicit_command=$1
@@ -960,9 +1675,10 @@ run_server() {
         (($#)) || fail "--pi-bin requires a path"
         explicit_command=$1
         agent=pi
+        explicit_agent=1
         shift
         ;;
-      --pi-bin=*) explicit_command=${arg#--pi-bin=}; agent=pi ;;
+      --pi-bin=*) explicit_command=${arg#--pi-bin=}; agent=pi; explicit_agent=1 ;;
       --no-attach) no_attach=1 ;;
       --dry-run) dry_run=1 ;;
       --configure-tmux) configure_tmux=1 ;;
@@ -984,14 +1700,29 @@ run_server() {
   done
 
   project_root=$(expand_home_path "$project_root")
-  mkdir -p "$project_root"
+  export PATH="$HOME/.local/npm-global/bin:$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
+
+  if (( saved_sessions )); then
+    [[ "$saved_agent" == "all" || "$saved_agent" == "pi" || "$saved_agent" == "codex" ]] || fail "--saved-agent must be all, pi, or codex"
+    [[ "$saved_session_limit" =~ ^[0-9]+$ ]] && (( saved_session_limit > 0 )) || fail "--saved-session-limit must be a positive integer"
+    local saved_filter
+    saved_filter=$(saved_session_filter "$agent" "$explicit_agent" "$saved_agent")
+    if (( do_list == 0 )); then
+      command -v tmux >/dev/null 2>&1 || fail "tmux is not installed on $(hostname)"
+    fi
+    if [[ ${agent_args+x} ]]; then
+      run_saved_sessions "$saved_filter" "$saved_session_limit" "$explicit_command" "$session_name" "$no_attach" "$dry_run" "$do_list" "${agent_args[@]}"
+    else
+      run_saved_sessions "$saved_filter" "$saved_session_limit" "$explicit_command" "$session_name" "$no_attach" "$dry_run" "$do_list"
+    fi
+    exit 0
+  fi
 
   if (( do_list )); then
     list_projects "$project_root"
     exit 0
   fi
 
-  export PATH="$HOME/.local/npm-global/bin:$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
   command -v tmux >/dev/null 2>&1 || fail "tmux is not installed on $(hostname)"
 
   if (( configure_tmux )); then
@@ -1017,14 +1748,23 @@ run_server() {
     validate_existing_name "$project_name" || fail "project names must be simple folder names under $project_root"
     [[ -d "$project_root/$project_name" ]] || fail "project does not exist: $project_root/$project_name (use --new $project_name to create it)"
   else
-    local project_selection
-    project_selection=$(pick_project_menu "$project_root")
+    local project_selection menu_saved_filter
+    menu_saved_filter=$(saved_session_filter "$agent" "$explicit_agent" "$saved_agent")
+    project_selection=$(pick_project_menu "$project_root" "$menu_saved_filter" "$saved_session_limit")
     project_name=${project_selection%%$'	'*}
     selected_session=${project_selection#*$'	'}
     if [[ "$selected_session" == "$project_selection" ]]; then
       selected_session=""
     fi
     if [[ "$project_name" == "__PI_REMOTE_QUIT__" ]]; then
+      exit 0
+    fi
+    if [[ "$project_name" == "__PI_REMOTE_SAVED__" ]]; then
+      if [[ ${agent_args+x} ]]; then
+        attach_saved_session_row "$selected_session" "$explicit_command" "$session_name" "$no_attach" "$dry_run" "${agent_args[@]}"
+      else
+        attach_saved_session_row "$selected_session" "$explicit_command" "$session_name" "$no_attach" "$dry_run"
+      fi
       exit 0
     fi
     project_was_interactive=1
@@ -1058,7 +1798,7 @@ run_server() {
 
   local agent_command
   agent_command="$launch_base"
-  if (( ${#agent_args[@]} > 0 )); then
+  if [[ ${agent_args+x} ]]; then
     agent_command+=" $(shell_join "${agent_args[@]}")"
   fi
 
@@ -1083,7 +1823,7 @@ run_server() {
   if session_exists "$session_name"; then
     if (( no_attach )); then
       printf 'tmux session already exists: %s\n' "$session_name"
-      printf 'attach with: ssh %s -t %s\n' "${PI_REMOTE_HOST:-$DEFAULT_HOST}" "$(shell_join tmux attach -t "$session_name")"
+      printf 'attach with: %s\n' "$(attach_command "$session_name")"
       exit 0
     fi
     exec tmux attach -t "$session_name"
@@ -1094,7 +1834,7 @@ run_server() {
     printf 'started detached tmux session: %s\n' "$session_name"
     printf 'project: %s\n' "$project_dir"
     printf 'agent: %s\n' "$agent"
-    printf 'attach with: ssh %s -t %s\n' "${PI_REMOTE_HOST:-$DEFAULT_HOST}" "$(shell_join tmux attach -t "$session_name")"
+    printf 'attach with: %s\n' "$(attach_command "$session_name")"
     exit 0
   fi
 
@@ -1158,6 +1898,7 @@ run_local() {
   local has_project=0
   local has_new=0
   local do_sessions=0
+  local do_saved_sessions=0
   local arg
 
   while (($#)); do
@@ -1200,6 +1941,14 @@ run_local() {
         shift
         ;;
       --sessions=*) do_sessions=1; server_args+=("$arg") ;;
+      --saved-sessions|--kittylitter) do_saved_sessions=1; server_args+=("$arg") ;;
+      --saved-agent|--saved-session-limit)
+        server_args+=("$arg")
+        (($#)) || fail "$arg requires a value"
+        server_args+=("$1")
+        shift
+        ;;
+      --saved-agent=*|--saved-session-limit=*) server_args+=("$arg") ;;
       --no-attach) no_attach=1; server_args+=("$arg") ;;
       --list) do_list=1; server_args+=("$arg") ;;
       --configure-tmux) configure_tmux=1; server_args+=("$arg") ;;
@@ -1237,6 +1986,11 @@ run_local() {
 
   if (( needs_tty )) && [[ ! -t 0 ]]; then
     fail "this mode needs a TTY for the menu/tmux attach; use --project/--new with --no-attach from automation"
+  fi
+
+  if is_local_host "$host"; then
+    PI_REMOTE_HOST=$host run_server --server "${server_args[@]}"
+    exit 0
   fi
 
   local quoted_args=""

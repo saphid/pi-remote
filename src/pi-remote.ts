@@ -11,9 +11,36 @@ const REMOTE_LEGACY_PROJECT_PATH = '"$HOME/projects/pi-remote/pi-remote"';
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), '.config/pi-remote/config');
 const DEFAULT_HOST = 'pi-remote';
 
-type MenuType = 'project' | 'session' | 'create' | 'quit';
-type MenuRow = { type: MenuType; project: string; session: string; label: string };
-type ProjectRow = { project: string; count: number; recent: number };
+process.stdout.on('error', (error: any) => {
+  if (isBrokenPipeError(error)) process.exit(0);
+  throw error;
+});
+
+type MenuType = 'project' | 'session' | 'saved' | 'create' | 'quit';
+type MenuRow = {
+  type: MenuType;
+  project: string;
+  session: string;
+  label: string;
+  saved?: SavedSession;
+  expandable?: boolean;
+  expanded?: boolean;
+};
+type ProjectRow = { project: string; count: number; savedCount: number; recent: number };
+type ProjectTreeProject = ProjectRow & { activeSessions: string[]; savedSessions: SavedSession[] };
+type ProjectTreeSnapshot = { root: string; projects: ProjectTreeProject[] };
+type SavedAgent = 'pi' | 'codex';
+type SavedSession = {
+  agent: SavedAgent;
+  id: string;
+  path: string;
+  cwd: string;
+  title: string;
+  model: string;
+  created: string;
+  modified: number;
+  messageCount: number;
+};
 type ServerOptions = {
   projectRoot: string;
   projectName: string;
@@ -26,9 +53,13 @@ type ServerOptions = {
   configureTmux: boolean;
   skipTmuxConfig: boolean;
   sessionsProject: string;
+  savedSessions: boolean;
+  savedSessionLimit: number;
+  savedAgent: string;
   selectedSession: string;
   projectWasInteractive: boolean;
   agent: string;
+  explicitAgent: boolean;
   explicitCommand: string;
   agentArgs: string[];
 };
@@ -46,6 +77,7 @@ type LocalOptions = {
   hasProject: boolean;
   hasNew: boolean;
   doSessions: boolean;
+  doSavedSessions: boolean;
 };
 
 function usage(): void {
@@ -58,11 +90,13 @@ Usage:
   pi-remote --agent pi|claude|codex        Choose the remote agent command (default: pi)
   pi-remote --project NAME --no-attach [-- AGENT_ARGS...]
   pi-remote --configure-tmux              Check/update remote tmux defaults, then exit
+  pi-remote --saved-sessions               Pick a saved Pi/Codex session and attach in tmux
+  pi-remote --saved-sessions --agent codex --list
   pi-remote --install-remote               Install/update the remote helper copy, then exit
   pi-remote --init-config --host HOST       Create a local config file, then exit
   pi-remote --list
 
-Interactive menus use ↑/↓ or j/k, ←/→ to expand project sessions, and Enter.
+Interactive menus use ↑/↓ or j/k, ←/→ to expand projects, and Enter.
 
 Options:
   --host HOST             SSH host to use (default: config host, PI_REMOTE_HOST, or pi-remote)
@@ -78,6 +112,10 @@ Options:
   --skip-tmux-config     Do not prompt about remote tmux config during interactive startup
   --list                  List remote projects and exit
   --sessions PROJECT      List tmux sessions whose panes are in PROJECT and exit
+  --saved-sessions        Pick/list saved Pi/Codex JSONL sessions instead of projects
+  --kittylitter           Alias for --saved-sessions
+  --saved-agent NAME      Saved-session filter: all, pi, or codex (default: all)
+  --saved-session-limit N Saved-session scan/list cap (default: 120)
   --dry-run               Print what would run without creating/attaching tmux
   --project-root PATH     Remote project root (default: ~/projects)
   --pi-bin PATH           Pi executable on the remote host (default: pi; backwards-compatible alias)
@@ -115,6 +153,26 @@ Automation-friendly example:
 function fail(message: string): never {
   process.stderr.write(`pi-remote: ${message}\n`);
   process.exit(1);
+}
+
+function isBrokenPipeError(error: any): boolean {
+  return error?.code === 'EPIPE' || error?.errno === -32 || /EPIPE|broken pipe/i.test(String(error?.message ?? error));
+}
+
+function safeStdoutWrite(value: string): void {
+  try {
+    process.stdout.write(value);
+  } catch (error: any) {
+    if (isBrokenPipeError(error)) process.exit(0);
+    throw error;
+  }
+}
+
+function parsePositiveIntegerOption(name: string, value: string | undefined): number {
+  if (!value || !/^\d+$/.test(value)) fail(`${name} must be a positive integer`);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) fail(`${name} must be a positive integer`);
+  return parsed;
 }
 
 function env(name: string): string | undefined {
@@ -384,32 +442,47 @@ function recentFile(): string {
   return env('PI_REMOTE_RECENTS') ?? path.join(os.homedir(), '.cache/pi-remote/recents.tsv');
 }
 
+function withoutTrailingSlashes(value: string): string {
+  return value.replace(/\/+$/, '') || '/';
+}
+
+function childPathPrefix(value: string): string {
+  const normalized = withoutTrailingSlashes(value);
+  return normalized === '/' ? '/' : `${normalized}/`;
+}
+
 function listProjectSessions(projectDir: string): string[] {
   if (!runOk('tmux', ['-V'])) return [];
   const output = commandOutput('tmux', ['list-panes', '-a', '-F', '#{session_name}\t#{pane_current_path}\t#{pane_current_command}'], '');
+  const normalizedProjectDir = withoutTrailingSlashes(projectDir);
+  const prefix = childPathPrefix(projectDir);
   const sessions = new Set<string>();
   for (const line of output.split(/\r?\n/)) {
     if (!line) continue;
     const [session, panePath] = line.split('\t');
-    if (panePath === projectDir || panePath?.startsWith(`${projectDir}/`)) sessions.add(session);
+    if (panePath === normalizedProjectDir || panePath?.startsWith(prefix)) sessions.add(session);
   }
   return [...sessions].sort((a, b) => a.localeCompare(b));
 }
 
-function projectSessionCounts(root: string): Map<string, number> {
-  const counts = new Map<string, Set<string>>();
+function projectSessionsByProject(root: string): Map<string, string[]> {
+  const sessionsByProject = new Map<string, Set<string>>();
   if (!runOk('tmux', ['-V'])) return new Map();
   const output = commandOutput('tmux', ['list-panes', '-a', '-F', '#{session_name}\t#{pane_current_path}\t#{pane_current_command}'], '');
-  const prefix = `${root}/`;
+  const prefix = childPathPrefix(root);
   for (const line of output.split(/\r?\n/)) {
     const [session, panePath] = line.split('\t');
     if (!session || !panePath?.startsWith(prefix)) continue;
     const project = panePath.slice(prefix.length).split('/')[0];
     if (!project) continue;
-    if (!counts.has(project)) counts.set(project, new Set());
-    counts.get(project)?.add(session);
+    if (!sessionsByProject.has(project)) sessionsByProject.set(project, new Set());
+    sessionsByProject.get(project)?.add(session);
   }
-  return new Map([...counts.entries()].map(([project, sessions]) => [project, sessions.size]));
+  return new Map([...sessionsByProject.entries()].map(([project, sessions]) => [project, [...sessions].sort((a, b) => a.localeCompare(b))]));
+}
+
+function projectSessionCounts(root: string): Map<string, number> {
+  return new Map([...projectSessionsByProject(root).entries()].map(([project, sessions]) => [project, sessions.length]));
 }
 
 function projectRecentTimes(root: string): Map<string, number> {
@@ -425,13 +498,17 @@ function projectRecentTimes(root: string): Map<string, number> {
   return recents;
 }
 
-function projectMenuRows(root: string): ProjectRow[] {
+function projectMenuRows(root: string, savedByProject: Map<string, SavedSession[]> = new Map()): ProjectRow[] {
   const counts = projectSessionCounts(root);
   const recents = projectRecentTimes(root);
-  const rows = listProjects(root).map((project) => `${project}\t${counts.get(project) ?? 0}\t${recents.get(project) ?? 0}`);
-  return sortWithSystemSort(rows, ['-t', '\t', '-k3,3nr', '-k2,2nr', '-k1,1']).map((line) => {
-    const [project, count = '0', recent = '0'] = line.split('\t');
-    return { project, count: Number(count) || 0, recent: Number(recent) || 0 };
+  const rows = listProjects(root).map((project) => {
+    const saved = savedByProject.get(project) ?? [];
+    const savedRecent = Math.max(0, ...saved.map((session) => Math.floor(session.modified / 1000)));
+    return `${project}\t${counts.get(project) ?? 0}\t${saved.length}\t${Math.max(recents.get(project) ?? 0, savedRecent)}`;
+  });
+  return sortWithSystemSort(rows, ['-t', '\t', '-k4,4nr', '-k2,2nr', '-k3,3nr', '-k1,1']).map((line) => {
+    const [project, count = '0', savedCount = '0', recent = '0'] = line.split('\t');
+    return { project, count: Number(count) || 0, savedCount: Number(savedCount) || 0, recent: Number(recent) || 0 };
   });
 }
 
@@ -450,27 +527,398 @@ function recordRecentProject(root: string, project: string): void {
   fs.writeFileSync(file, `${rows.slice(0, 200).join('\n')}\n`);
 }
 
+function newestJsonlFiles(root: string, limit: number): string[] {
+  if (!fs.existsSync(root)) return [];
+  const files: Array<{ file: string; mtime: number }> = [];
+  const walk = (dir: string) => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(file);
+      else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        try {
+          files.push({ file, mtime: fs.statSync(file).mtimeMs });
+        } catch {
+          // Ignore files that disappear while scanning.
+        }
+      }
+    }
+  };
+  walk(root);
+  files.sort((a, b) => b.mtime - a.mtime);
+  return files.slice(0, limit).map((row) => row.file);
+}
+
+function safeJson(line: string): any | null {
+  try {
+    return JSON.parse(line);
+  } catch {
+    return null;
+  }
+}
+
+const SAVED_SESSION_SCAN_BYTES = 256 * 1024;
+
+function readSavedSessionPrefix(file: string, stat: fs.Stats): string {
+  if (stat.size <= SAVED_SESSION_SCAN_BYTES) return fs.readFileSync(file, 'utf8');
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buffer = Buffer.allocUnsafe(SAVED_SESSION_SCAN_BYTES);
+    const bytesRead = fs.readSync(fd, buffer, 0, SAVED_SESSION_SCAN_BYTES, 0);
+    const text = buffer.subarray(0, bytesRead).toString('utf8');
+    const lastNewline = text.lastIndexOf('\n');
+    return lastNewline >= 0 ? text.slice(0, lastNewline + 1) : text;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function savedSessionScanLines(file: string, stat: fs.Stats): string[] {
+  return readSavedSessionPrefix(file, stat).split(/\r?\n/);
+}
+
+function contentToText(content: any): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map((block) => {
+    if (typeof block === 'string') return block;
+    if (!block || typeof block !== 'object') return '';
+    if (typeof block.text === 'string') return block.text;
+    if (typeof block.input_text === 'string') return block.input_text;
+    return '';
+  }).filter(Boolean).join('\n');
+}
+
+function cleanTitle(text: string): string {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return '(untitled)';
+  return normalized.length > 120 ? `${normalized.slice(0, 119).trim()}…` : normalized;
+}
+
+function parsePiSavedSession(file: string): SavedSession | null {
+  let header: any | null = null;
+  let name = '';
+  let firstUser = '';
+  let model = '';
+  let messageCount = 0;
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(file);
+    const lines = savedSessionScanLines(file, stat);
+    for (let index = 0; index < lines.length; index += 1) {
+      const entry = safeJson(lines[index]);
+      if (!entry) continue;
+      if (index === 0 && entry.type === 'session') header = entry;
+      else if (entry.type === 'session_info' && typeof entry.name === 'string') name = entry.name.trim();
+      else if (entry.type === 'model_change') model = [entry.provider, entry.modelId].filter(Boolean).join('/');
+      else if (entry.type === 'message' && entry.message) {
+        const role = entry.message.role;
+        if (role === 'user' || role === 'assistant') messageCount += 1;
+        if (role === 'user' && !firstUser) firstUser = contentToText(entry.message.content);
+      }
+    }
+  } catch {
+    return null;
+  }
+  if (!header || typeof header.id !== 'string') return null;
+  return {
+    agent: 'pi',
+    id: header.id,
+    path: file,
+    cwd: typeof header.cwd === 'string' ? header.cwd : os.homedir(),
+    title: cleanTitle(name || firstUser),
+    model,
+    created: typeof header.timestamp === 'string' ? header.timestamp : '',
+    modified: stat.mtimeMs,
+    messageCount,
+  };
+}
+
+function looksLikeCodexBootstrapText(text: string): boolean {
+  const trimmed = text.trim();
+  return !trimmed || trimmed.startsWith('# AGENTS.md instructions') || trimmed.startsWith('<environment_context>') || trimmed.startsWith('<permissions instructions>');
+}
+
+function parseCodexSavedSession(file: string): SavedSession | null {
+  let id = '';
+  let cwd = os.homedir();
+  let created = '';
+  let firstUser = '';
+  let model = '';
+  let messageCount = 0;
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(file);
+    const lines = savedSessionScanLines(file, stat);
+    for (const line of lines) {
+      const entry = safeJson(line);
+      if (!entry) continue;
+      const payload = entry.payload && typeof entry.payload === 'object' ? entry.payload : {};
+      if (entry.type === 'session_meta') {
+        if (payload.id) id = String(payload.id);
+        cwd = String(payload.cwd || cwd);
+        created = String(payload.timestamp || entry.timestamp || created || '');
+      } else if (entry.type === 'turn_context') {
+        cwd = String(payload.cwd || cwd);
+        if (payload.model) model = String(payload.model);
+      } else if (entry.type === 'event_msg') {
+        const eventType = payload.type;
+        if (eventType === 'user_message') {
+          messageCount += 1;
+          if (!firstUser && typeof payload.message === 'string' && !looksLikeCodexBootstrapText(payload.message)) firstUser = payload.message;
+        } else if (typeof eventType === 'string' && eventType.startsWith('agent_message')) {
+          messageCount += 1;
+        }
+      } else if (entry.type === 'response_item' && payload.type === 'message') {
+        if (payload.role === 'user' || payload.role === 'assistant') messageCount += 1;
+        if (payload.role === 'user' && !firstUser) {
+          const text = contentToText(payload.content);
+          if (!looksLikeCodexBootstrapText(text)) firstUser = text;
+        }
+      }
+    }
+  } catch {
+    return null;
+  }
+  if (!id) {
+    const match = path.basename(file, '.jsonl').match(/([0-9a-f]{8}-[0-9a-f-]{27,})/);
+    id = match?.[1] ?? path.basename(file, '.jsonl');
+  }
+  return {
+    agent: 'codex',
+    id,
+    path: file,
+    cwd,
+    title: cleanTitle(firstUser),
+    model,
+    created,
+    modified: stat.mtimeMs,
+    messageCount,
+  };
+}
+
+function savedSessionFilter(options: ServerOptions): string {
+  if (options.explicitAgent && (options.agent === 'pi' || options.agent === 'codex')) return options.agent;
+  return options.savedAgent;
+}
+
+function listSavedSessionsForFilter(filter: string, limit: number): SavedSession[] {
+  const sessions: SavedSession[] = [];
+  if (filter === 'all' || filter === 'pi') {
+    for (const file of newestJsonlFiles(path.join(os.homedir(), '.pi/agent/sessions'), limit)) {
+      const session = parsePiSavedSession(file);
+      if (session) sessions.push(session);
+    }
+  }
+  if (filter === 'all' || filter === 'codex') {
+    for (const file of newestJsonlFiles(path.join(os.homedir(), '.codex/sessions'), limit)) {
+      const session = parseCodexSavedSession(file);
+      if (session) sessions.push(session);
+    }
+  }
+  sessions.sort((a, b) => b.modified - a.modified);
+  return sessions.slice(0, limit);
+}
+
+function listSavedSessions(options: ServerOptions): SavedSession[] {
+  return listSavedSessionsForFilter(savedSessionFilter(options), options.savedSessionLimit);
+}
+
+function projectNameForCwd(root: string, cwd: string): string {
+  const rootPath = path.resolve(root);
+  const cwdPath = path.resolve(expandHomePath(cwd || os.homedir()));
+  const relative = path.relative(rootPath, cwdPath);
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return '';
+  const project = relative.split(path.sep)[0] ?? '';
+  return validateExistingName(project) ? project : '';
+}
+
+function savedSessionsByProject(root: string, filter: string, limit: number, projects = new Set(listProjects(root))): Map<string, SavedSession[]> {
+  const byProject = new Map<string, SavedSession[]>();
+  for (const session of listSavedSessionsForFilter(filter, limit)) {
+    const project = projectNameForCwd(root, session.cwd);
+    if (!project || !projects.has(project)) continue;
+    if (!byProject.has(project)) byProject.set(project, []);
+    byProject.get(project)?.push(session);
+  }
+  for (const sessions of byProject.values()) sessions.sort((a, b) => b.modified - a.modified);
+  return byProject;
+}
+
+function savedSessionAge(modified: number): string {
+  const seconds = Math.max(0, Math.floor((Date.now() - modified) / 1000));
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  if (seconds < 86400 * 30) return `${Math.floor(seconds / 86400)}d`;
+  return `${Math.floor(seconds / (86400 * 30))}mo`;
+}
+
+function oneLine(value: string): string {
+  return value.replace(/[\t\r\n]/g, ' ');
+}
+
+function clipEnd(value: string, max: number): string {
+  const clean = oneLine(value);
+  if (max <= 0) return '';
+  const chars = Array.from(clean);
+  if (chars.length <= max) return clean;
+  if (max === 1) return '…';
+  return `${chars.slice(0, max - 1).join('')}…`;
+}
+
+function clipStart(value: string, max: number): string {
+  const clean = oneLine(value);
+  if (max <= 0) return '';
+  const chars = Array.from(clean);
+  if (chars.length <= max) return clean;
+  if (max === 1) return '…';
+  return `…${chars.slice(chars.length - max + 1).join('')}`;
+}
+
+function fitLine(value: string, max: number): string {
+  return clipEnd(value, max);
+}
+
+function terminalColumns(): number {
+  const columns = process.stdout.columns;
+  return columns && Number.isFinite(columns) ? Math.max(20, columns) : 80;
+}
+
+function menuLabelWidth(): number {
+  return Math.max(40, terminalColumns() - 4);
+}
+
+function savedSessionLabel(session: SavedSession, maxWidth = 112): string {
+  const width = Math.max(40, maxWidth);
+  const cwdRaw = session.cwd.replace(os.homedir(), '~');
+  const shortId = session.id.slice(0, 12);
+  const prefix = `${session.agent.padEnd(5)} ${savedSessionAge(session.modified).padStart(5)}  `;
+  const suffix = `  ${shortId}`;
+  const available = width - prefix.length - suffix.length - 2;
+
+  if (available < 34) {
+    const titleWidth = Math.max(8, width - prefix.length - suffix.length);
+    return fitLine(`${prefix}${clipEnd(session.title, titleWidth)}${suffix}`, width);
+  }
+
+  let cwdWidth = Math.min(34, Math.max(14, Math.floor(available / 3)));
+  let titleWidth = available - cwdWidth - 2;
+  if (titleWidth < 18) {
+    titleWidth = 18;
+    cwdWidth = Math.max(8, available - titleWidth - 2);
+  }
+
+  const title = clipEnd(session.title, titleWidth).padEnd(titleWidth);
+  const cwd = clipStart(cwdRaw, cwdWidth).padEnd(cwdWidth);
+  return fitLine(`${prefix}${title}  ${cwd}${suffix}`, width);
+}
+
+function printSavedSessions(sessions: SavedSession[]): void {
+  for (const [index, session] of sessions.entries()) {
+    safeStdoutWrite(`${String(index + 1).padStart(3, '0')}  ${savedSessionLabel(session)}\n`);
+  }
+}
+
+function savedTmuxSessionName(session: SavedSession): string {
+  return sanitizeName(`pi-remote-${session.agent}-${session.id}`).slice(0, 48);
+}
+
+function resolveSavedAgentCommand(agent: SavedAgent, explicitCommand: string): string {
+  if (explicitCommand) return explicitCommand;
+  // Saved-session resumes need the selected agent's resume/session subcommand;
+  // launch_command is intentionally only used for generic project launches.
+  if (agent === 'pi') return env('PI_REMOTE_PI_BIN') ?? configGet('pi_command', 'pi');
+  return env('PI_REMOTE_CODEX_BIN') ?? configGet('codex_command', 'codex');
+}
+
+function savedSessionCommand(session: SavedSession, explicitCommand: string, agentArgs: string[]): string {
+  const base = resolveSavedAgentCommand(session.agent, explicitCommand);
+  checkLaunchCommandExists(base);
+  const suffix = agentArgs.length ? ` ${shellJoin(agentArgs)}` : '';
+  if (session.agent === 'pi') return `${base} --session ${shellQuote(session.path)}${suffix}`;
+  return `${base} resume ${shellQuote(session.id)}${suffix}`;
+}
+
+async function attachSavedSession(session: SavedSession, options: ServerOptions): Promise<void> {
+  const sessionName = sanitizeName(options.sessionName || savedTmuxSessionName(session));
+
+  if (sessionExists(sessionName)) {
+    if (options.noAttach || options.dryRun) {
+      process.stdout.write(`tmux session already exists: ${sessionName}\n`);
+      process.stdout.write(`attach with: ${attachCommand(sessionName)}\n`);
+      return;
+    }
+    const attach = run('tmux', ['attach', '-t', sessionName], { stdio: 'inherit' });
+    if (attach.error) fail(`failed to run tmux: ${attach.error.message}`);
+    process.exit(attach.status ?? 1);
+  }
+
+  const agentCommand = savedSessionCommand(session, options.explicitCommand, options.agentArgs);
+
+  if (options.dryRun) {
+    process.stdout.write(`host=${os.hostname()}\nsaved_session=${session.path}\ncwd=${session.cwd}\ntmux_session=${sessionName}\nagent=${session.agent}\nattach=${options.noAttach ? 'no' : 'yes'}\ncommand=${agentCommand}\n`);
+    return;
+  }
+
+  if (options.noAttach) {
+    const created = run('tmux', ['new-session', '-d', '-s', sessionName, '-c', session.cwd, agentCommand]);
+    if (created.status !== 0) fail(String(created.stderr ?? 'failed to start tmux session'));
+    process.stdout.write(`started detached tmux session: ${sessionName}\ncwd: ${session.cwd}\nagent: ${session.agent}\nattach with: ${attachCommand(sessionName)}\n`);
+    return;
+  }
+
+  const attached = run('tmux', ['new-session', '-s', sessionName, '-c', session.cwd, agentCommand], { stdio: 'inherit' });
+  if (attached.error) fail(`failed to run tmux: ${attached.error.message}`);
+  process.exit(attached.status ?? 1);
+}
+
+async function runSavedSessions(options: ServerOptions): Promise<void> {
+  const sessions = listSavedSessions(options);
+  if (options.doList) {
+    printSavedSessions(sessions);
+    return;
+  }
+  if (!sessions.length) fail(`no saved sessions found for agent filter '${savedSessionFilter(options)}'`);
+  if (!process.stdin.isTTY) fail('interactive saved-session menu needs a TTY; pass --list for non-interactive use');
+  const labels = sessions.map((session) => savedSessionLabel(session, menuLabelWidth()));
+  const choice = await arrowSelect(`Saved Pi/Codex sessions on ${os.hostname()} (↑/↓ or j/k, Enter)`, labels);
+  if (choice === null) return;
+  await attachSavedSession(sessions[choice], options);
+}
 
 function printLines(lines: string[]): void {
-  if (lines.length > 0) process.stdout.write(`${lines.join('\n')}\n`);
+  if (lines.length > 0) safeStdoutWrite(`${lines.join('\n')}\n`);
 }
 
 function terminalRows(): number {
   return process.stdout.rows && Number.isFinite(process.stdout.rows) ? process.stdout.rows : 24;
 }
 
+function menuVisibleRows(maxItems?: number): number {
+  const visible = Math.max(5, Math.min(20, terminalRows() - 4));
+  return maxItems === undefined ? visible : Math.min(maxItems, visible);
+}
+
 function renderArrowMenu(prompt: string, selected: number, offset: number, visible: number, items: string[]): void {
-  process.stdout.write(`\r\x1b[K${prompt}\n`);
+  const columns = terminalColumns();
+  const lineWidth = Math.max(1, columns - 1);
+  const labelWidth = Math.max(1, columns - 3);
+  process.stdout.write(`\r\x1b[K${fitLine(prompt, lineWidth)}\n`);
   for (let row = 0; row < visible; row += 1) {
     const index = offset + row;
     if (index < items.length) {
-      const label = items[index];
+      const label = fitLine(items[index], labelWidth);
       process.stdout.write(index === selected ? `\x1b[K\x1b[7m› ${label}\x1b[0m\n` : `\x1b[K  ${label}\n`);
     } else {
       process.stdout.write('\x1b[K\n');
     }
   }
-  process.stdout.write(`\x1b[K[${selected + 1}/${items.length}] ↑/↓ or j/k, Enter\n`);
+  process.stdout.write(`\x1b[K${fitLine(`[${selected + 1}/${items.length}] ↑/↓ or j/k, Enter`, lineWidth)}\n`);
 }
 
 function keyName(chunk: Buffer): string {
@@ -494,7 +942,7 @@ async function arrowSelect(prompt: string, items: string[]): Promise<number | nu
   if (!items.length || !process.stdin.isTTY) return null;
   let selected = 0;
   let offset = 0;
-  const visible = Math.min(items.length, Math.max(5, Math.min(20, terminalRows() - 4)));
+  const visible = menuVisibleRows(items.length);
   const lines = visible + 2;
   process.stdin.setRawMode(true);
   process.stdin.resume();
@@ -520,6 +968,7 @@ async function arrowSelect(prompt: string, items: string[]): Promise<number | nu
     }
   } finally {
     process.stdin.setRawMode(false);
+    process.stdin.pause();
     process.stdout.write('\x1b[?25h\n');
   }
 }
@@ -528,18 +977,61 @@ function expandedContains(expanded: string, project: string): boolean {
   return expanded.includes(`|${project}|`);
 }
 
-function buildProjectTreeRows(root: string, expanded: string): MenuRow[] {
+function projectSessionSummary(activeCount: number, savedCount: number): string {
+  const parts: string[] = [];
+  if (activeCount > 0) parts.push(`${activeCount} active`);
+  if (savedCount > 0) parts.push(`${savedCount} saved`);
+  return parts.length ? parts.join(', ') : '0';
+}
+
+function buildProjectTreeSnapshot(root: string, savedFilter = 'all', savedLimit = 120): ProjectTreeSnapshot {
+  const projectNames = listProjects(root);
+  const projectSet = new Set(projectNames);
+  const activeByProject = projectSessionsByProject(root);
+  const savedByProject = savedSessionsByProject(root, savedFilter, savedLimit, projectSet);
+  const recents = projectRecentTimes(root);
+  const sortableRows = projectNames.map((project) => {
+    const activeSessions = activeByProject.get(project) ?? [];
+    const savedSessions = savedByProject.get(project) ?? [];
+    const savedRecent = Math.max(0, ...savedSessions.map((session) => Math.floor(session.modified / 1000)));
+    return `${project}\t${activeSessions.length}\t${savedSessions.length}\t${Math.max(recents.get(project) ?? 0, savedRecent)}`;
+  });
+  const projects = sortWithSystemSort(sortableRows, ['-t', '\t', '-k4,4nr', '-k2,2nr', '-k3,3nr', '-k1,1']).map((line) => {
+    const [project, count = '0', savedCount = '0', recent = '0'] = line.split('\t');
+    return {
+      project,
+      count: Number(count) || 0,
+      savedCount: Number(savedCount) || 0,
+      recent: Number(recent) || 0,
+      activeSessions: activeByProject.get(project) ?? [],
+      savedSessions: savedByProject.get(project) ?? [],
+    };
+  });
+  return { root, projects };
+}
+
+function buildProjectTreeRowsFromSnapshot(snapshot: ProjectTreeSnapshot, expanded: string): MenuRow[] {
   const rows: MenuRow[] = [];
-  for (const { project, count } of projectMenuRows(root)) {
+  const savedLabelWidth = Math.max(36, menuLabelWidth() - 6);
+  for (const { project, count, savedCount, activeSessions, savedSessions } of snapshot.projects) {
+    const totalCount = count + savedCount;
+    const isExpanded = totalCount > 0 && expandedContains(expanded, project);
     rows.push({
       type: 'project',
       project,
       session: '',
-      label: count > 0 ? `${expandedContains(expanded, project) ? '▾' : '▸'} ${project} (${count})` : `  ${project} (0)`,
+      expandable: totalCount > 0,
+      expanded: isExpanded,
+      label: totalCount > 0
+        ? `${isExpanded ? '▾' : '▸'} ${project} (${projectSessionSummary(count, savedCount)})`
+        : `  ${project} (0)`,
     });
-    if (count > 0 && expandedContains(expanded, project)) {
-      for (const session of listProjectSessions(path.join(root, project))) {
-        rows.push({ type: 'session', project, session, label: `    ↳ ${session}` });
+    if (isExpanded) {
+      for (const session of activeSessions) {
+        rows.push({ type: 'session', project, session, label: `    ● ${session}` });
+      }
+      for (const saved of savedSessions) {
+        rows.push({ type: 'saved', project, session: '', saved, label: `    ◷ ${savedSessionLabel(saved, savedLabelWidth)}` });
       }
     }
   }
@@ -548,18 +1040,47 @@ function buildProjectTreeRows(root: string, expanded: string): MenuRow[] {
   return rows;
 }
 
+function buildProjectTreeRows(root: string, expanded: string, savedFilter = 'all', savedLimit = 120): MenuRow[] {
+  return buildProjectTreeRowsFromSnapshot(buildProjectTreeSnapshot(root, savedFilter, savedLimit), expanded);
+}
+
+function projectTreeRowLabel(row: MenuRow, selected: boolean): string {
+  if (!selected || row.type !== 'project') return row.label;
+  if (row.expandable) {
+    const projectLabel = row.label.replace(/^[▸▾]\s+/, '');
+    return `${row.expanded ? '▾ ← collapse' : '▸ → expand'} · Enter=new  ${projectLabel}`;
+  }
+  return `Enter=new  ${row.label.trimStart()}`;
+}
+
+function projectTreeFooter(selected: number, rows: MenuRow[]): string {
+  const position = `[${selected + 1}/${rows.length}]`;
+  const current = rows[selected];
+  if (!current) return `${position} ↑/↓ move  Enter select`;
+  if (current.type === 'project') {
+    return current.expandable
+      ? `${position} ↑/↓ move  ←/→ expand/collapse  Enter new session`
+      : `${position} ↑/↓ move  Enter new session`;
+  }
+  if (current.type === 'session' || current.type === 'saved') return `${position} ↑/↓ move  Enter resume  ←/→ collapse project`;
+  return `${position} ↑/↓ move  Enter select`;
+}
+
 function renderProjectTreeMenu(prompt: string, selected: number, offset: number, visible: number, rows: MenuRow[]): void {
-  process.stdout.write(`\r\x1b[K${prompt}\n`);
+  const columns = terminalColumns();
+  const lineWidth = Math.max(1, columns - 1);
+  const labelWidth = Math.max(1, columns - 3);
+  process.stdout.write(`\r\x1b[K${fitLine(prompt, lineWidth)}\n`);
   for (let row = 0; row < visible; row += 1) {
     const index = offset + row;
     if (index < rows.length) {
-      const label = rows[index].label;
+      const label = fitLine(projectTreeRowLabel(rows[index], index === selected), labelWidth);
       process.stdout.write(index === selected ? `\x1b[K\x1b[7m› ${label}\x1b[0m\n` : `\x1b[K  ${label}\n`);
     } else {
       process.stdout.write('\x1b[K\n');
     }
   }
-  process.stdout.write(`\x1b[K[${selected + 1}/${rows.length}] ↑/↓ move  ←/→ expand sessions  Enter select\n`);
+  process.stdout.write(`\x1b[K${fitLine(projectTreeFooter(selected, rows), lineWidth)}\n`);
 }
 
 function askLine(prompt: string): Promise<string> {
@@ -567,13 +1088,15 @@ function askLine(prompt: string): Promise<string> {
   return new Promise((resolve) => rl.question(prompt, (answer) => { rl.close(); resolve(answer); }));
 }
 
-async function pickProjectMenu(root: string): Promise<{ project: string; session: string; quit: boolean }> {
+async function pickProjectMenu(root: string, options: ServerOptions): Promise<{ project: string; session: string; quit: boolean; saved?: SavedSession }> {
   if (!process.stdin.isTTY) fail('interactive project menu needs a TTY; pass --project NAME or --new NAME for non-interactive use');
   let expanded = '|';
   let selected = 0;
   let offset = 0;
-  let rows = buildProjectTreeRows(root, expanded);
-  let visible = Math.min(rows.length, Math.max(5, Math.min(20, terminalRows() - 4)));
+  const savedFilter = savedSessionFilter(options);
+  const snapshot = buildProjectTreeSnapshot(root, savedFilter, options.savedSessionLimit);
+  let rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded);
+  const visible = menuVisibleRows();
   const lines = visible + 2;
   process.stdin.setRawMode(true);
   process.stdin.resume();
@@ -588,11 +1111,10 @@ async function pickProjectMenu(root: string): Promise<{ project: string; session
       else if (key === 'down' || key === 'j' || key === 'J') { selected += 1; redraw = true; }
       else if (key === 'left' || key === 'right') {
         const current = rows[selected];
-        if (current && (current.type === 'project' || current.type === 'session') && current.project) {
+        if (current && (current.type === 'project' || current.type === 'session' || current.type === 'saved') && current.project && (current.type !== 'project' || current.expandable)) {
           expanded = expandedContains(expanded, current.project) ? expanded.replace(`|${current.project}|`, '|') : `${expanded}${current.project}|`;
-          rows = buildProjectTreeRows(root, expanded);
+          rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded);
           selected = Math.max(0, rows.findIndex((row) => row.type === 'project' && row.project === current.project));
-          visible = Math.min(rows.length, Math.max(5, Math.min(20, terminalRows() - 4)));
           redraw = true;
         }
       } else if (key === 'q' || key === 'Q') {
@@ -601,6 +1123,7 @@ async function pickProjectMenu(root: string): Promise<{ project: string; session
         const current = rows[selected];
         if (current.type === 'project') return { project: current.project, session: '', quit: false };
         if (current.type === 'session') return { project: current.project, session: current.session, quit: false };
+        if (current.type === 'saved' && current.saved) return { project: '', session: '', quit: false, saved: current.saved };
         if (current.type === 'quit') return { project: '', session: '', quit: true };
         process.stdin.setRawMode(false);
         process.stdout.write('\x1b[?25h\n');
@@ -621,6 +1144,7 @@ async function pickProjectMenu(root: string): Promise<{ project: string; session
     }
   } finally {
     if (process.stdin.isRaw) process.stdin.setRawMode(false);
+    process.stdin.pause();
     process.stdout.write('\x1b[?25h\n');
   }
 }
@@ -666,6 +1190,13 @@ function checkLaunchCommandExists(commandValue: string): void {
   }
 }
 
+function attachCommand(sessionName: string): string {
+  const args = ['tmux', 'attach', '-t', sessionName];
+  const host = env('PI_REMOTE_HOST') ?? DEFAULT_HOST;
+  if (isLocalHost(host)) return shellJoin(args);
+  return `ssh ${shellQuote(host)} -t ${shellJoin(args)}`;
+}
+
 function projectDirFromArg(root: string, project: string): string {
   return project.startsWith('/') ? project : path.join(root, project);
 }
@@ -685,9 +1216,13 @@ async function runServer(args: string[]): Promise<void> {
     configureTmux: false,
     skipTmuxConfig: false,
     sessionsProject: '',
+    savedSessions: false,
+    savedSessionLimit: 120,
+    savedAgent: 'all',
     selectedSession: '',
     projectWasInteractive: false,
     agent: env('PI_REMOTE_AGENT') ?? (configuredAgent || 'pi'),
+    explicitAgent: false,
     explicitCommand: '',
     agentArgs: [],
   };
@@ -701,10 +1236,13 @@ async function runServer(args: string[]): Promise<void> {
       case '--project': options.projectName = args[++index] ?? fail('--project requires a name'); break;
       case '--new': options.newName = args[++index] ?? fail('--new requires a name'); break;
       case '--session': options.sessionName = args[++index] ?? fail('--session requires a name'); options.explicitSession = true; break;
-      case '--agent': options.agent = args[++index] ?? fail('--agent requires a value'); break;
+      case '--agent': options.agent = args[++index] ?? fail('--agent requires a value'); options.explicitAgent = true; break;
+      case '--saved-agent': options.savedAgent = args[++index] ?? fail('--saved-agent requires all, pi, or codex'); break;
+      case '--saved-session-limit': options.savedSessionLimit = parsePositiveIntegerOption('--saved-session-limit', args[++index]); break;
+      case '--saved-sessions': case '--kittylitter': options.savedSessions = true; break;
       case '--command': options.explicitCommand = args[++index] ?? fail('--command requires a shell command'); break;
       case '--project-root': options.projectRoot = args[++index] ?? fail('--project-root requires a path'); break;
-      case '--pi-bin': options.explicitCommand = args[++index] ?? fail('--pi-bin requires a path'); options.agent = 'pi'; break;
+      case '--pi-bin': options.explicitCommand = args[++index] ?? fail('--pi-bin requires a path'); options.agent = 'pi'; options.explicitAgent = true; break;
       case '--no-attach': options.noAttach = true; break;
       case '--dry-run': options.dryRun = true; break;
       case '--configure-tmux': options.configureTmux = true; break;
@@ -716,10 +1254,12 @@ async function runServer(args: string[]): Promise<void> {
         if (arg.startsWith('--project=')) options.projectName = arg.slice('--project='.length);
         else if (arg.startsWith('--new=')) options.newName = arg.slice('--new='.length);
         else if (arg.startsWith('--session=')) { options.sessionName = arg.slice('--session='.length); options.explicitSession = true; }
-        else if (arg.startsWith('--agent=')) options.agent = arg.slice('--agent='.length);
+        else if (arg.startsWith('--agent=')) { options.agent = arg.slice('--agent='.length); options.explicitAgent = true; }
+        else if (arg.startsWith('--saved-agent=')) options.savedAgent = arg.slice('--saved-agent='.length);
+        else if (arg.startsWith('--saved-session-limit=')) options.savedSessionLimit = parsePositiveIntegerOption('--saved-session-limit', arg.slice('--saved-session-limit='.length));
         else if (arg.startsWith('--command=')) options.explicitCommand = arg.slice('--command='.length);
         else if (arg.startsWith('--project-root=')) options.projectRoot = arg.slice('--project-root='.length);
-        else if (arg.startsWith('--pi-bin=')) { options.explicitCommand = arg.slice('--pi-bin='.length); options.agent = 'pi'; }
+        else if (arg.startsWith('--pi-bin=')) { options.explicitCommand = arg.slice('--pi-bin='.length); options.agent = 'pi'; options.explicitAgent = true; }
         else if (arg.startsWith('--sessions=')) options.sessionsProject = arg.slice('--sessions='.length);
         else if (arg.startsWith('--')) fail(`unknown option for server mode: ${arg}`);
         else options.agentArgs.push(arg);
@@ -727,14 +1267,20 @@ async function runServer(args: string[]): Promise<void> {
   }
 
   options.projectRoot = expandHomePath(options.projectRoot);
-  fs.mkdirSync(options.projectRoot, { recursive: true });
+  process.env.PATH = `${os.homedir()}/.local/npm-global/bin:${os.homedir()}/.npm-global/bin:${os.homedir()}/.local/bin:${process.env.PATH ?? ''}`;
+
+  if (options.savedSessions) {
+    if (options.savedAgent !== 'all' && options.savedAgent !== 'pi' && options.savedAgent !== 'codex') fail('--saved-agent must be all, pi, or codex');
+    if (!options.doList && !runOk('tmux', ['-V'])) fail(`tmux is not installed on ${os.hostname()}`);
+    await runSavedSessions(options);
+    return;
+  }
 
   if (options.doList) {
     printLines(listProjects(options.projectRoot));
     return;
   }
 
-  process.env.PATH = `${os.homedir()}/.local/npm-global/bin:${os.homedir()}/.npm-global/bin:${os.homedir()}/.local/bin:${process.env.PATH ?? ''}`;
   if (!runOk('tmux', ['-V'])) fail(`tmux is not installed on ${os.hostname()}`);
 
   if (options.configureTmux) {
@@ -758,8 +1304,12 @@ async function runServer(args: string[]): Promise<void> {
     if (!validateExistingName(options.projectName)) fail(`project names must be simple folder names under ${options.projectRoot}`);
     if (!fs.existsSync(path.join(options.projectRoot, options.projectName))) fail(`project does not exist: ${path.join(options.projectRoot, options.projectName)} (use --new ${options.projectName} to create it)`);
   } else {
-    const selection = await pickProjectMenu(options.projectRoot);
+    const selection = await pickProjectMenu(options.projectRoot, options);
     if (selection.quit) return;
+    if (selection.saved) {
+      await attachSavedSession(selection.saved, options);
+      return;
+    }
     options.projectName = selection.project;
     options.selectedSession = selection.session;
     options.projectWasInteractive = true;
@@ -799,7 +1349,7 @@ async function runServer(args: string[]): Promise<void> {
   if (sessionExists(options.sessionName)) {
     if (options.noAttach) {
       process.stdout.write(`tmux session already exists: ${options.sessionName}\n`);
-      process.stdout.write(`attach with: ssh ${env('PI_REMOTE_HOST') ?? DEFAULT_HOST} -t ${shellJoin(['tmux', 'attach', '-t', options.sessionName])}\n`);
+      process.stdout.write(`attach with: ${attachCommand(options.sessionName)}\n`);
       return;
     }
     const attach = run('tmux', ['attach', '-t', options.sessionName], { stdio: 'inherit' });
@@ -810,7 +1360,7 @@ async function runServer(args: string[]): Promise<void> {
   if (options.noAttach) {
     const created = run('tmux', ['new-session', '-d', '-s', options.sessionName, '-c', projectDir, agentCommand]);
     if (created.status !== 0) fail(String(created.stderr ?? 'failed to start tmux session'));
-    process.stdout.write(`started detached tmux session: ${options.sessionName}\nproject: ${projectDir}\nagent: ${options.agent}\nattach with: ssh ${env('PI_REMOTE_HOST') ?? DEFAULT_HOST} -t ${shellJoin(['tmux', 'attach', '-t', options.sessionName])}\n`);
+    process.stdout.write(`started detached tmux session: ${options.sessionName}\nproject: ${projectDir}\nagent: ${options.agent}\nattach with: ${attachCommand(options.sessionName)}\n`);
     return;
   }
 
@@ -874,6 +1424,7 @@ function parseLocal(args: string[]): LocalOptions {
     hasProject: false,
     hasNew: false,
     doSessions: false,
+    doSavedSessions: false,
   };
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -886,6 +1437,9 @@ function parseLocal(args: string[]): LocalOptions {
       case '--project': options.hasProject = true; options.serverArgs.push(arg, args[++index] ?? fail('--project requires a name')); break;
       case '--new': options.hasNew = true; options.serverArgs.push(arg, args[++index] ?? fail('--new requires a name')); break;
       case '--sessions': options.doSessions = true; options.serverArgs.push(arg, args[++index] ?? fail('--sessions requires a project name')); break;
+      case '--saved-sessions': case '--kittylitter': options.doSavedSessions = true; options.serverArgs.push(arg); break;
+      case '--saved-agent': options.serverArgs.push(arg, args[++index] ?? fail('--saved-agent requires all, pi, or codex')); break;
+      case '--saved-session-limit': options.serverArgs.push(arg, args[++index] ?? fail('--saved-session-limit requires a number')); break;
       case '--no-attach': options.noAttach = true; options.serverArgs.push(arg); break;
       case '--list': options.doList = true; options.serverArgs.push(arg); break;
       case '--configure-tmux': options.configureTmux = true; options.serverArgs.push(arg); break;
@@ -897,6 +1451,7 @@ function parseLocal(args: string[]): LocalOptions {
         else if (arg.startsWith('--project=')) { options.hasProject = true; options.serverArgs.push(arg); }
         else if (arg.startsWith('--new=')) { options.hasNew = true; options.serverArgs.push(arg); }
         else if (arg.startsWith('--sessions=')) { options.doSessions = true; options.serverArgs.push(arg); }
+        else if (arg.startsWith('--saved-agent=') || arg.startsWith('--saved-session-limit=')) options.serverArgs.push(arg);
         else options.serverArgs.push(arg);
     }
   }
@@ -908,7 +1463,11 @@ function parseLocal(args: string[]): LocalOptions {
   return options;
 }
 
-function runLocal(args: string[]): void {
+function isLocalHost(host: string): boolean {
+  return host === 'local' || host === 'localhost' || host === '127.0.0.1' || host === '.';
+}
+
+async function runLocal(args: string[]): Promise<void> {
   const options = parseLocal(args);
   if (options.initConfig) {
     writeLocalConfig(options.host);
@@ -919,6 +1478,11 @@ function runLocal(args: string[]): void {
     return;
   }
   if (options.needsTty && !process.stdin.isTTY) fail('this mode needs a TTY for the menu/tmux attach; use --project/--new with --no-attach from automation');
+  if (isLocalHost(options.host)) {
+    process.env.PI_REMOTE_HOST = options.host;
+    await runServer(['--server', ...options.serverArgs]);
+    return;
+  }
   const quotedArgs = options.serverArgs.length ? ` ${shellJoin(options.serverArgs)}` : '';
   const quotedHost = shellQuote(options.host);
   const remoteCommand = `remote_helper=${REMOTE_PROJECT_PATH}; if [[ ! -x $remote_helper ]]; then remote_helper=${REMOTE_LEGACY_PROJECT_PATH}; fi; if [[ ! -x $remote_helper ]]; then printf 'pi-remote is not installed on the remote host at %s or %s\\n' ${REMOTE_PROJECT_PATH} ${REMOTE_LEGACY_PROJECT_PATH} >&2; exit 127; fi; export PI_REMOTE_HOST=${quotedHost}; exec $remote_helper --server${quotedArgs}`;
@@ -931,7 +1495,7 @@ function runLocal(args: string[]): void {
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args[0] === '--server') await runServer(args);
-  else runLocal(args);
+  else await runLocal(args);
 }
 
 main().catch((error: unknown) => {
