@@ -1683,6 +1683,10 @@ function installRemote(host) {
     const installScript = `set -e
 PATH="$HOME/.bun/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 export PATH
+if [ -d "$HOME/${targetDir}/.git" ] && command -v git >/dev/null 2>&1; then
+  git -C "$HOME/${targetDir}" fetch --tags --prune origin >/dev/null 2>&1 || true
+  git -C "$HOME/${targetDir}" pull --ff-only >/dev/null 2>&1 || true
+fi
 install -m 0755 "$HOME/pi-remote.js.tmp" "$HOME/${targetDir}/dist/pi-remote.js"
 install -m 0755 "$HOME/pi-remote.wrapper.tmp" "$HOME/${targetDir}/pi-remote"
 install -m 0755 "$HOME/pi-remote.sh.tmp" "$HOME/${targetDir}/pi-remote.sh"

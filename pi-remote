@@ -12,7 +12,7 @@ while [ -L "$SOURCE" ]; do
   esac
 done
 DIR=$(CDPATH='' cd -P -- "$(dirname -- "$SOURCE")" && pwd)
-export PI_REMOTE_PACKAGE_ROOT=${PI_REMOTE_PACKAGE_ROOT:-$DIR}
+export PI_REMOTE_PACKAGE_ROOT="${PI_REMOTE_PACKAGE_ROOT:-$DIR}"
 JS="$DIR/dist/pi-remote.js"
 if command -v bun >/dev/null 2>&1 && [ -r "$JS" ]; then
   exec bun "$JS" "$@"

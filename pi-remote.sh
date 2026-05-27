@@ -15,7 +15,7 @@ DIR=$(CDPATH='' cd -P -- "$(dirname -- "$SOURCE")" && pwd)
 if [ -x "$DIR/pi-remote" ] && [ "$DIR/pi-remote" != "$SOURCE" ]; then
   exec "$DIR/pi-remote" "$@"
 fi
-export PI_REMOTE_PACKAGE_ROOT=${PI_REMOTE_PACKAGE_ROOT:-$DIR}
+export PI_REMOTE_PACKAGE_ROOT="${PI_REMOTE_PACKAGE_ROOT:-$DIR}"
 JS="$DIR/dist/pi-remote.js"
 if command -v bun >/dev/null 2>&1 && [ -r "$JS" ]; then
   exec bun "$JS" "$@"
