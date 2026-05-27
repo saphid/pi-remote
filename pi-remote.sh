@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
+GITHUB_REPO="https://github.com/saphid/pi-remote.git"
 # Literal remote-shell expression; expanded on the remote host, not on the local machine.
 # shellcheck disable=SC2016
 REMOTE_PROJECT_PATH='"$HOME/projects/pi-remote/pi-remote.sh"'
@@ -21,13 +22,14 @@ Usage:
   pi-remote.sh --agent pi|claude|codex      Choose the remote agent command (default: pi)
   pi-remote.sh --project NAME --no-attach [-- AGENT_ARGS...]
   pi-remote.sh --configure-tmux            Check/update remote tmux defaults, then exit
+  pi-remote.sh --update                     Pull/update this pi-remote install from GitHub, then exit
   pi-remote.sh --saved-sessions             Pick a saved Pi/Codex session and attach in tmux
   pi-remote.sh --saved-sessions --agent codex --list
   pi-remote.sh --install-remote             Install/update the remote helper copy, then exit
   pi-remote.sh --init-config --host HOST     Create a local config file, then exit
   pi-remote.sh --list
 
-Interactive menus use ↑/↓ or j/k, ←/→ to expand projects, and Enter.
+Interactive project menus use ↑/↓ to move, type to filter by project name, Backspace/Ctrl+U to edit the filter, ←/→ to expand projects, and Enter. Saved-session pickers also support j/k.
 
 Options:
   --host HOST             SSH host to use (default: config host, PI_REMOTE_HOST, or pi-remote)
@@ -39,6 +41,7 @@ Options:
   --no-attach             Create the tmux session detached and print the attach command
   --configure-tmux       Ask to install/update pi-remote tmux defaults and exit
   --install-remote       Install/update the remote helper copy and exit
+  --update               Pull/update this pi-remote install from GitHub and report if newer
   --init-config          Create the local config file if missing and exit
   --skip-tmux-config     Do not prompt about remote tmux config during interactive startup
   --list                  List remote projects and exit
@@ -1192,6 +1195,9 @@ build_project_tree_rows() {
   local expanded=$2
   local saved_filter=${3:-all}
   local saved_limit=${4:-120}
+  local name_filter=${5:-}
+  local name_filter_lower project_lower
+  name_filter_lower=$(printf '%s' "$name_filter" | tr '[:upper:]' '[:lower:]')
   local project count saved_count _recent total_count session saved_row agent modified sid path_field cwd title model created msg_count
   local saved_label_width cleanup_after=0 expandable is_expanded
   MENU_TYPES=()
@@ -1213,6 +1219,10 @@ build_project_tree_rows() {
 
   while IFS=$'\t' read -r project count saved_count _recent; do
     [[ -n "$project" ]] || continue
+    project_lower=$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]')
+    if [[ -n "$name_filter_lower" && "$project_lower" != *"$name_filter_lower"* ]]; then
+      continue
+    fi
     count=${count:-0}
     saved_count=${saved_count:-0}
     total_count=$((count + saved_count))
@@ -1300,42 +1310,53 @@ project_tree_row_label() {
   local index=$1
   local selected=$2
   local label=${MENU_LABELS[$index]}
-  local project_label trimmed
   if (( ! selected )) || [[ "${MENU_TYPES[$index]}" != "project" ]]; then
     printf '%s' "$label"
     return 0
   fi
   if (( ${MENU_EXPANDABLE[$index]:-0} )); then
-    project_label=${label#▸ }
-    project_label=${project_label#▾ }
     if (( ${MENU_EXPANDED[$index]:-0} )); then
-      printf '▾ ← collapse · Enter=new  %s' "$project_label"
+      printf '%s  ← collapse · Enter=new' "$label"
     else
-      printf '▸ → expand · Enter=new  %s' "$project_label"
+      printf '%s  → expand · Enter=new' "$label"
     fi
     return 0
   fi
-  trimmed=${label# }
-  trimmed=${trimmed# }
-  printf 'Enter=new  %s' "$trimmed"
+  printf '%s  Enter=new' "$label"
+}
+
+project_tree_prompt() {
+  local root=$1
+  local name_filter=${2:-}
+  if [[ -n "$name_filter" ]]; then
+    printf 'Projects on %s in %s — filter: %s' "$(hostname)" "$root" "$name_filter"
+  else
+    printf 'Projects on %s in %s' "$(hostname)" "$root"
+  fi
 }
 
 project_tree_footer() {
   local selected=$1
   local count=$2
-  local position current_type
+  local name_filter=${3:-}
+  local position current_type hint
   position=$(printf '[%d/%d]' "$((selected + 1))" "$count")
+  if [[ -n "$name_filter" ]]; then
+    hint=$(printf '  filter: %s  Backspace edit Ctrl+U clear' "$name_filter")
+  else
+    hint='  type to filter'
+  fi
   current_type=${MENU_TYPES[$selected]:-}
   if [[ "$current_type" == "project" ]]; then
     if (( ${MENU_EXPANDABLE[$selected]:-0} )); then
-      printf '%s ↑/↓ move  ←/→ expand/collapse  Enter new session' "$position"
+      printf '%s ↑/↓ move  ←/→ expand/collapse  Enter new session%s' "$position" "$hint"
     else
-      printf '%s ↑/↓ move  Enter new session' "$position"
+      printf '%s ↑/↓ move  Enter new session%s' "$position" "$hint"
     fi
   elif [[ "$current_type" == "session" || "$current_type" == "saved" ]]; then
-    printf '%s ↑/↓ move  Enter resume  ←/→ collapse project' "$position"
+    printf '%s ↑/↓ move  Enter resume  ←/→ collapse project%s' "$position" "$hint"
   else
-    printf '%s ↑/↓ move  Enter select' "$position"
+    printf '%s ↑/↓ move  Enter select%s' "$position" "$hint"
   fi
 }
 
@@ -1344,6 +1365,7 @@ render_project_tree_menu() {
   local selected=$2
   local offset=$3
   local visible=$4
+  local name_filter=${5:-}
   local count=${#MENU_LABELS[@]}
   local row index label cols line_width label_width status
 
@@ -1367,7 +1389,7 @@ render_project_tree_menu() {
       printf '\033[K\n' >/dev/tty
     fi
   done
-  status=$(project_tree_footer "$selected" "$count")
+  status=$(project_tree_footer "$selected" "$count" "$name_filter")
   printf '\033[K%s\n' "$(fit_line "$status" "$line_width")" >/dev/tty
 }
 
@@ -1378,6 +1400,7 @@ pick_project_menu() {
   local expanded="|"
   local selected=0
   local offset=0
+  local name_filter=""
   local terminal_rows visible lines count
   local key rest old_stty redraw current_type current_project current_saved new_name safe_name selected_session
 
@@ -1386,7 +1409,7 @@ pick_project_menu() {
   fi
 
   build_project_tree_snapshot "$root" "$saved_filter" "$saved_limit"
-  build_project_tree_rows "$root" "$expanded" "$saved_filter" "$saved_limit"
+  build_project_tree_rows "$root" "$expanded" "$saved_filter" "$saved_limit" "$name_filter"
   count=${#MENU_LABELS[@]}
   terminal_rows=$(tput lines 2>/dev/null || printf '24')
   [[ "$terminal_rows" =~ ^[0-9]+$ ]] || terminal_rows=24
@@ -1398,7 +1421,7 @@ pick_project_menu() {
   old_stty=$(stty -g < /dev/tty)
   stty -echo -icanon min 1 time 0 < /dev/tty
   printf '\033[?25l' >/dev/tty
-  render_project_tree_menu "Projects on $(hostname) in $root" "$selected" "$offset" "$visible"
+  render_project_tree_menu "$(project_tree_prompt "$root" "$name_filter")" "$selected" "$offset" "$visible" "$name_filter"
 
   while IFS= read -rsn1 key < /dev/tty; do
     redraw=0
@@ -1419,7 +1442,7 @@ pick_project_menu() {
                 else
                   expanded+="$current_project|"
                 fi
-                build_project_tree_rows "$root" "$expanded" "$saved_filter" "$saved_limit"
+                build_project_tree_rows "$root" "$expanded" "$saved_filter" "$saved_limit" "$name_filter"
                 count=${#MENU_LABELS[@]}
                 selected=$(find_project_row_index "$current_project")
                 redraw=1
@@ -1428,14 +1451,25 @@ pick_project_menu() {
             ;;
         esac
         ;;
-      k|K) selected=$((selected - 1)); redraw=1 ;;
-      j|J) selected=$((selected + 1)); redraw=1 ;;
-      q|Q)
-        stty "$old_stty" < /dev/tty
-        printf '\033[?25h\n' >/dev/tty
-        cleanup_project_tree_snapshot
-        printf '__PI_REMOTE_QUIT__\t\n'
-        return 0
+      $'\x7f'|$'\b')
+        if [[ -n "$name_filter" ]]; then
+          name_filter=${name_filter%?}
+          build_project_tree_rows "$root" "$expanded" "$saved_filter" "$saved_limit" "$name_filter"
+          count=${#MENU_LABELS[@]}
+          selected=0
+          offset=0
+          redraw=1
+        fi
+        ;;
+      $'\x15')
+        if [[ -n "$name_filter" ]]; then
+          name_filter=""
+          build_project_tree_rows "$root" "$expanded" "$saved_filter" "$saved_limit" "$name_filter"
+          count=${#MENU_LABELS[@]}
+          selected=0
+          offset=0
+          redraw=1
+        fi
         ;;
       ""|$'\n'|$'\r')
         current_type=${MENU_TYPES[$selected]}
@@ -1472,6 +1506,16 @@ pick_project_menu() {
             ;;
         esac
         ;;
+      ?)
+        if [[ "$key" =~ ^[[:print:]]$ ]]; then
+          name_filter+="$key"
+          build_project_tree_rows "$root" "$expanded" "$saved_filter" "$saved_limit" "$name_filter"
+          count=${#MENU_LABELS[@]}
+          selected=0
+          offset=0
+          redraw=1
+        fi
+        ;;
     esac
 
     if (( redraw )); then
@@ -1489,7 +1533,7 @@ pick_project_menu() {
         offset=0
       fi
       printf '\033[%dA' "$lines" >/dev/tty
-      render_project_tree_menu "Projects on $(hostname) in $root" "$selected" "$offset" "$visible"
+      render_project_tree_menu "$(project_tree_prompt "$root" "$name_filter")" "$selected" "$offset" "$visible" "$name_filter"
     fi
   done
 
@@ -1841,6 +1885,177 @@ run_server() {
   exec tmux new-session -s "$session_name" -c "$project_dir" "$agent_command"
 }
 
+package_root() {
+  local source=${BASH_SOURCE[0]}
+  local dir target
+  while [[ -L "$source" ]]; do
+    dir=$(CDPATH='' cd -P -- "$(dirname -- "$source")" && pwd)
+    target=$(readlink "$source")
+    if [[ "$target" == /* ]]; then
+      source=$target
+    else
+      source=$dir/$target
+    fi
+  done
+  CDPATH='' cd -P -- "$(dirname -- "$source")" && pwd
+}
+
+read_package_version() {
+  local root=$1
+  local package_json="$root/package.json"
+  if [[ -r "$package_json" ]]; then
+    sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$package_json" | head -n1
+  else
+    printf '%s\n' "$VERSION"
+  fi
+}
+
+git_output() {
+  local root=$1
+  shift
+  git -C "$root" "$@" 2>/dev/null || true
+}
+
+is_git_checkout() {
+  local root=$1
+  git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1
+}
+
+git_short_commit() {
+  local root=$1
+  local ref=${2:-HEAD}
+  local short
+  short=$(git_output "$root" rev-parse --short "$ref" | tr -d '\n')
+  if [[ -n "$short" ]]; then
+    printf '%s\n' "$short"
+  else
+    printf 'unknown\n'
+  fi
+}
+
+git_package_version() {
+  local root=$1
+  local ref=$2
+  local fallback=$3
+  local version
+  version=$(git -C "$root" show "$ref:package.json" 2>/dev/null | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1 || true)
+  if [[ -n "$version" ]]; then
+    printf '%s\n' "$version"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+
+resolve_git_upstream() {
+  local root=$1
+  local upstream
+  upstream=$(git_output "$root" rev-parse --abbrev-ref --symbolic-full-name '@{u}' | tr -d '\n')
+  if [[ -n "$upstream" ]]; then
+    printf '%s\n' "$upstream"
+    return 0
+  fi
+  if git -C "$root" rev-parse --verify --quiet origin/main >/dev/null; then
+    printf 'origin/main\n'
+    return 0
+  fi
+  if git -C "$root" rev-parse --verify --quiet origin/master >/dev/null; then
+    printf 'origin/master\n'
+    return 0
+  fi
+  upstream=$(git_output "$root" symbolic-ref --quiet --short refs/remotes/origin/HEAD | tr -d '\n')
+  if [[ -n "$upstream" ]]; then
+    printf '%s\n' "$upstream"
+    return 0
+  fi
+  fail 'could not determine the GitHub upstream branch for this pi-remote checkout'
+}
+
+git_dirty() {
+  local root=$1
+  [[ -n $(git_output "$root" status --porcelain) ]]
+}
+
+remove_directory_contents() {
+  local root=$1
+  local resolved
+  resolved=$(CDPATH='' cd -P -- "$root" 2>/dev/null && pwd || true)
+  [[ -n "$resolved" ]] || { mkdir -p "$root"; resolved=$(CDPATH='' cd -P -- "$root" && pwd); }
+  [[ "$resolved" != "/" ]] || fail "refusing to update unsafe package root: $resolved"
+  find "$resolved" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+}
+
+update_git_checkout() {
+  local root=$1
+  local upstream current_version current_commit latest_version latest_commit counts ahead behind
+  command -v git >/dev/null 2>&1 || fail 'git is required for --update'
+  printf 'fetching updates from %s\n' "$GITHUB_REPO"
+  git -C "$root" fetch --tags --prune origin || fail 'git fetch failed'
+  upstream=$(resolve_git_upstream "$root")
+  current_version=$(read_package_version "$root")
+  current_commit=$(git_short_commit "$root" HEAD)
+  latest_version=$(git_package_version "$root" "$upstream" "$current_version")
+  latest_commit=$(git_short_commit "$root" "$upstream")
+  counts=$(git -C "$root" rev-list --left-right --count "HEAD...$upstream" 2>/dev/null || printf '0 0')
+  ahead=${counts%%[[:space:]]*}
+  behind=${counts##*[[:space:]]}
+  [[ "$ahead" =~ ^[0-9]+$ ]] || ahead=0
+  [[ "$behind" =~ ^[0-9]+$ ]] || behind=0
+
+  if (( behind > 0 )); then
+    if [[ "$current_version" == "$latest_version" ]]; then
+      printf 'new GitHub update available for pi-remote %s: %s -> %s\n' "$current_version" "$current_commit" "$latest_commit"
+    else
+      printf 'new pi-remote version available: %s (%s) -> %s (%s)\n' "$current_version" "$current_commit" "$latest_version" "$latest_commit"
+    fi
+    git_dirty "$root" && fail "cannot update $root: working tree has uncommitted changes"
+    git -C "$root" pull --ff-only || fail 'git pull failed'
+    printf 'updated pi-remote to %s (%s)\n' "$(read_package_version "$root")" "$(git_short_commit "$root" HEAD)"
+    return 0
+  fi
+
+  if (( ahead > 0 )); then
+    printf 'no newer GitHub version found; local checkout is ahead by %s commit%s (%s %s)\n' "$ahead" "$([[ $ahead -eq 1 ]] && printf '' || printf s)" "$current_version" "$current_commit"
+  else
+    printf 'pi-remote is already up to date: %s (%s)\n' "$current_version" "$current_commit"
+  fi
+}
+
+update_copied_install_from_github() {
+  local root=$1
+  local current_version temp_root latest_version latest_commit entry
+  command -v git >/dev/null 2>&1 || fail 'git is required for --update'
+  current_version=$(read_package_version "$root")
+  temp_root=$(mktemp -d "${TMPDIR:-/tmp}/pi-remote-update.XXXXXX")
+  printf 'fetching latest pi-remote from %s\n' "$GITHUB_REPO"
+  git clone --depth 1 "$GITHUB_REPO" "$temp_root" || fail 'git clone failed'
+  latest_version=$(read_package_version "$temp_root")
+  latest_commit=$(git_short_commit "$temp_root" HEAD)
+  if [[ "$current_version" == "$latest_version" ]]; then
+    printf 'no newer package version found on GitHub (current %s); refreshing latest GitHub copy (%s)\n' "$current_version" "$latest_commit"
+  else
+    printf 'new pi-remote version available: %s -> %s (%s)\n' "$current_version" "$latest_version" "$latest_commit"
+  fi
+  remove_directory_contents "$root"
+  shopt -s dotglob nullglob
+  for entry in "$temp_root"/*; do
+    cp -R "$entry" "$root/"
+  done
+  shopt -u dotglob nullglob
+  chmod +x "$root/pi-remote" "$root/pi-remote.sh" "$root/dist/pi-remote.js" 2>/dev/null || true
+  rm -rf "$temp_root"
+  printf 'updated pi-remote from GitHub: %s (%s)\n' "$latest_version" "$latest_commit"
+}
+
+update_local_install() {
+  local root
+  root=$(package_root)
+  if is_git_checkout "$root"; then
+    update_git_checkout "$root"
+  else
+    update_copied_install_from_github "$root"
+  fi
+}
+
 install_remote() {
   local host=$1
   local target_dir='projects/pi-remote'
@@ -1888,6 +2103,7 @@ run_local() {
   config_host=$(config_get host "")
   local host=${PI_REMOTE_HOST:-${config_host:-$DEFAULT_HOST}}
   local install=0
+  local update=0
   local init_config=0
   local server_args=()
   local needs_tty=1
@@ -1914,6 +2130,7 @@ run_local() {
         ;;
       --host=*) host=${arg#--host=} ;;
       --install-remote) install=1 ;;
+      --update) update=1 ;;
       --init-config) init_config=1 ;;
       --project|--project=*)
         has_project=1
@@ -1969,6 +2186,11 @@ run_local() {
 
   if (( install )); then
     install_remote "$host"
+    exit 0
+  fi
+
+  if (( update )); then
+    update_local_install
     exit 0
   fi
 

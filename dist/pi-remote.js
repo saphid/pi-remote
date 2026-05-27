@@ -39,7 +39,8 @@ const os = __importStar(require("node:os"));
 const path = __importStar(require("node:path"));
 const readline = __importStar(require("node:readline"));
 const node_child_process_1 = require("node:child_process");
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
+const GITHUB_REPO = 'https://github.com/saphid/pi-remote.git';
 const REMOTE_PROJECT_PATH = '"$HOME/projects/pi-remote/pi-remote.sh"';
 const REMOTE_LEGACY_PROJECT_PATH = '"$HOME/projects/pi-remote/pi-remote"';
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), '.config/pi-remote/config');
@@ -59,13 +60,14 @@ Usage:
   pi-remote --agent pi|claude|codex        Choose the remote agent command (default: pi)
   pi-remote --project NAME --no-attach [-- AGENT_ARGS...]
   pi-remote --configure-tmux              Check/update remote tmux defaults, then exit
+  pi-remote --update                       Pull/update this pi-remote install from GitHub, then exit
   pi-remote --saved-sessions               Pick a saved Pi/Codex session and attach in tmux
   pi-remote --saved-sessions --agent codex --list
   pi-remote --install-remote               Install/update the remote helper copy, then exit
   pi-remote --init-config --host HOST       Create a local config file, then exit
   pi-remote --list
 
-Interactive menus use ↑/↓ or j/k, ←/→ to expand projects, and Enter.
+Interactive project menus use ↑/↓ to move, type to filter by project name, Backspace/Ctrl+U to edit the filter, ←/→ to expand projects, and Enter. Saved-session pickers also support j/k.
 
 Options:
   --host HOST             SSH host to use (default: config host, PI_REMOTE_HOST, or pi-remote)
@@ -77,6 +79,7 @@ Options:
   --no-attach             Create the tmux session detached and print the attach command
   --configure-tmux       Ask to install/update pi-remote tmux defaults and exit
   --install-remote       Install/update the remote helper copy and exit
+  --update               Pull/update this pi-remote install from GitHub and report if newer
   --init-config          Create the local config file if missing and exit
   --skip-tmux-config     Do not prompt about remote tmux config during interactive startup
   --list                  List remote projects and exit
@@ -916,6 +919,12 @@ function keyName(chunk) {
     const value = chunk.toString('utf8');
     if (value === '\u0003')
         return 'ctrl-c';
+    if (value === '\u0015')
+        return 'ctrl-u';
+    if (value === '\u007f' || value === '\b')
+        return 'backspace';
+    if (value === '\u001b')
+        return 'escape';
     if (value === '\r' || value === '\n')
         return 'enter';
     if (value === '\u001b[A' || value === '\u001bOA')
@@ -926,6 +935,8 @@ function keyName(chunk) {
         return 'right';
     if (value === '\u001b[D' || value === '\u001bOD')
         return 'left';
+    if (value === '\u001b[3~')
+        return 'delete';
     return value;
 }
 function readKey() {
@@ -993,6 +1004,22 @@ function projectSessionSummary(activeCount, savedCount) {
         parts.push(`${savedCount} saved`);
     return parts.length ? parts.join(', ') : '0';
 }
+function projectMatchesFilter(project, filter) {
+    const needle = filter.trim().toLowerCase();
+    return !needle || project.toLowerCase().includes(needle);
+}
+function removeLastInputCharacter(value) {
+    const chars = Array.from(value);
+    chars.pop();
+    return chars.join('');
+}
+function isProjectFilterKey(key) {
+    return /^[ -~]$/.test(key);
+}
+function projectTreePrompt(root, filter) {
+    const base = `Projects on ${os.hostname()} in ${root}`;
+    return filter ? `${base} — filter: ${filter}` : base;
+}
 function buildProjectTreeSnapshot(root, savedFilter = 'all', savedLimit = 120) {
     const projectNames = listProjects(root);
     const projectSet = new Set(projectNames);
@@ -1018,10 +1045,12 @@ function buildProjectTreeSnapshot(root, savedFilter = 'all', savedLimit = 120) {
     });
     return { root, projects };
 }
-function buildProjectTreeRowsFromSnapshot(snapshot, expanded) {
+function buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter = '') {
     const rows = [];
     const savedLabelWidth = Math.max(36, menuLabelWidth() - 6);
     for (const { project, count, savedCount, activeSessions, savedSessions } of snapshot.projects) {
+        if (!projectMatchesFilter(project, filter))
+            continue;
         const totalCount = count + savedCount;
         const isExpanded = totalCount > 0 && expandedContains(expanded, project);
         rows.push({
@@ -1047,33 +1076,36 @@ function buildProjectTreeRowsFromSnapshot(snapshot, expanded) {
     rows.push({ type: 'quit', project: '', session: '', label: 'Quit' });
     return rows;
 }
-function buildProjectTreeRows(root, expanded, savedFilter = 'all', savedLimit = 120) {
-    return buildProjectTreeRowsFromSnapshot(buildProjectTreeSnapshot(root, savedFilter, savedLimit), expanded);
+function buildProjectTreeRows(root, expanded, savedFilter = 'all', savedLimit = 120, filter = '') {
+    return buildProjectTreeRowsFromSnapshot(buildProjectTreeSnapshot(root, savedFilter, savedLimit), expanded, filter);
 }
 function projectTreeRowLabel(row, selected) {
     if (!selected || row.type !== 'project')
         return row.label;
     if (row.expandable) {
-        const projectLabel = row.label.replace(/^[▸▾]\s+/, '');
-        return `${row.expanded ? '▾ ← collapse' : '▸ → expand'} · Enter=new  ${projectLabel}`;
+        return `${row.label}  ${row.expanded ? '← collapse' : '→ expand'} · Enter=new`;
     }
-    return `Enter=new  ${row.label.trimStart()}`;
+    return `${row.label}  Enter=new`;
 }
-function projectTreeFooter(selected, rows) {
+function projectTreeFilterHint(filter) {
+    return filter ? `  filter: ${filter}  Backspace edit Ctrl+U clear` : '  type to filter';
+}
+function projectTreeFooter(selected, rows, filter = '') {
     const position = `[${selected + 1}/${rows.length}]`;
     const current = rows[selected];
+    const hint = projectTreeFilterHint(filter);
     if (!current)
-        return `${position} ↑/↓ move  Enter select`;
+        return `${position} ↑/↓ move  Enter select${hint}`;
     if (current.type === 'project') {
         return current.expandable
-            ? `${position} ↑/↓ move  ←/→ expand/collapse  Enter new session`
-            : `${position} ↑/↓ move  Enter new session`;
+            ? `${position} ↑/↓ move  ←/→ expand/collapse  Enter new session${hint}`
+            : `${position} ↑/↓ move  Enter new session${hint}`;
     }
     if (current.type === 'session' || current.type === 'saved')
-        return `${position} ↑/↓ move  Enter resume  ←/→ collapse project`;
-    return `${position} ↑/↓ move  Enter select`;
+        return `${position} ↑/↓ move  Enter resume  ←/→ collapse project${hint}`;
+    return `${position} ↑/↓ move  Enter select${hint}`;
 }
-function renderProjectTreeMenu(prompt, selected, offset, visible, rows) {
+function renderProjectTreeMenu(prompt, selected, offset, visible, rows, filter = '') {
     const columns = terminalColumns();
     const lineWidth = Math.max(1, columns - 1);
     const labelWidth = Math.max(1, columns - 3);
@@ -1088,7 +1120,7 @@ function renderProjectTreeMenu(prompt, selected, offset, visible, rows) {
             process.stdout.write('\x1b[K\n');
         }
     }
-    process.stdout.write(`\x1b[K${fitLine(projectTreeFooter(selected, rows), lineWidth)}\n`);
+    process.stdout.write(`\x1b[K${fitLine(projectTreeFooter(selected, rows, filter), lineWidth)}\n`);
 }
 function askLine(prompt) {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -1100,40 +1132,62 @@ async function pickProjectMenu(root, options) {
     let expanded = '|';
     let selected = 0;
     let offset = 0;
+    let filter = '';
     const savedFilter = savedSessionFilter(options);
     const snapshot = buildProjectTreeSnapshot(root, savedFilter, options.savedSessionLimit);
-    let rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded);
+    let rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter);
     const visible = menuVisibleRows();
     const lines = visible + 2;
+    const rebuildRowsForFilter = () => {
+        rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter);
+        selected = 0;
+        offset = 0;
+    };
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdout.write('\x1b[?25l');
-    renderProjectTreeMenu(`Projects on ${os.hostname()} in ${root}`, selected, offset, visible, rows);
+    renderProjectTreeMenu(projectTreePrompt(root, filter), selected, offset, visible, rows, filter);
     try {
         for (;;) {
             const key = await readKey();
             let redraw = false;
             if (key === 'ctrl-c')
                 process.exit(130);
-            if (key === 'up' || key === 'k' || key === 'K') {
+            if (key === 'up') {
                 selected -= 1;
                 redraw = true;
             }
-            else if (key === 'down' || key === 'j' || key === 'J') {
+            else if (key === 'down') {
                 selected += 1;
                 redraw = true;
+            }
+            else if (key === 'backspace' || key === 'delete') {
+                if (filter) {
+                    filter = removeLastInputCharacter(filter);
+                    rebuildRowsForFilter();
+                    redraw = true;
+                }
+            }
+            else if (key === 'ctrl-u' || key === 'escape') {
+                if (filter) {
+                    filter = '';
+                    rebuildRowsForFilter();
+                    redraw = true;
+                }
             }
             else if (key === 'left' || key === 'right') {
                 const current = rows[selected];
                 if (current && (current.type === 'project' || current.type === 'session' || current.type === 'saved') && current.project && (current.type !== 'project' || current.expandable)) {
                     expanded = expandedContains(expanded, current.project) ? expanded.replace(`|${current.project}|`, '|') : `${expanded}${current.project}|`;
-                    rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded);
+                    rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter);
                     selected = Math.max(0, rows.findIndex((row) => row.type === 'project' && row.project === current.project));
                     redraw = true;
                 }
             }
-            else if (key === 'q' || key === 'Q') {
-                return { project: '', session: '', quit: true };
+            else if (isProjectFilterKey(key)) {
+                filter += key;
+                rebuildRowsForFilter();
+                redraw = true;
             }
             else if (key === 'enter') {
                 const current = rows[selected];
@@ -1164,7 +1218,7 @@ async function pickProjectMenu(root, options) {
                 if (offset < 0)
                     offset = 0;
                 process.stdout.write(`\x1b[${lines}A`);
-                renderProjectTreeMenu(`Projects on ${os.hostname()} in ${root}`, selected, offset, visible, rows);
+                renderProjectTreeMenu(projectTreePrompt(root, filter), selected, offset, visible, rows, filter);
             }
         }
     }
@@ -1461,6 +1515,147 @@ async function runServer(args) {
 function ensureParent(file) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
 }
+function currentPackageRoot() {
+    return path.resolve(__dirname, '..');
+}
+function commandExists(command) {
+    return runOk('bash', ['-lc', `command -v ${shellQuote(command)} >/dev/null 2>&1`]);
+}
+function gitOutput(root, args, fallback = '') {
+    return commandOutput('git', ['-C', root, ...args], fallback).trim();
+}
+function isGitCheckout(root) {
+    return runOk('git', ['-C', root, 'rev-parse', '--is-inside-work-tree']);
+}
+function readPackageVersion(root) {
+    try {
+        const parsed = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+        return typeof parsed.version === 'string' && parsed.version ? parsed.version : VERSION;
+    }
+    catch {
+        return VERSION;
+    }
+}
+function gitPackageVersion(root, ref, fallback) {
+    try {
+        const content = commandOutput('git', ['-C', root, 'show', `${ref}:package.json`], '');
+        if (!content)
+            return fallback;
+        const parsed = JSON.parse(content);
+        return typeof parsed.version === 'string' && parsed.version ? parsed.version : fallback;
+    }
+    catch {
+        return fallback;
+    }
+}
+function gitShortCommit(root, ref = 'HEAD') {
+    return gitOutput(root, ['rev-parse', '--short', ref], 'unknown') || 'unknown';
+}
+function resolveGitUpstream(root) {
+    const configured = gitOutput(root, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], '');
+    if (configured)
+        return configured;
+    for (const candidate of ['origin/main', 'origin/master']) {
+        if (runOk('git', ['-C', root, 'rev-parse', '--verify', '--quiet', candidate]))
+            return candidate;
+    }
+    const originHead = gitOutput(root, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD'], '');
+    if (originHead)
+        return originHead;
+    fail('could not determine the GitHub upstream branch for this pi-remote checkout');
+}
+function gitAheadBehind(root, upstream) {
+    const output = gitOutput(root, ['rev-list', '--left-right', '--count', `HEAD...${upstream}`], '0 0');
+    const [ahead = '0', behind = '0'] = output.split(/\s+/);
+    return { ahead: Number(ahead) || 0, behind: Number(behind) || 0 };
+}
+function isGitDirty(root) {
+    return Boolean(gitOutput(root, ['status', '--porcelain'], ''));
+}
+function runGitOrFail(root, args, label) {
+    const result = run('git', ['-C', root, ...args], { stdio: 'inherit' });
+    if (result.error)
+        fail(`${label}: ${result.error.message}`);
+    if (result.status !== 0)
+        fail(`${label} failed`);
+}
+function updateGitCheckout(root) {
+    if (!commandExists('git'))
+        fail('git is required for --update');
+    process.stdout.write(`fetching updates from ${GITHUB_REPO}\n`);
+    runGitOrFail(root, ['fetch', '--tags', '--prune', 'origin'], 'git fetch');
+    const upstream = resolveGitUpstream(root);
+    const currentVersion = readPackageVersion(root);
+    const currentCommit = gitShortCommit(root, 'HEAD');
+    const latestVersion = gitPackageVersion(root, upstream, currentVersion);
+    const latestCommit = gitShortCommit(root, upstream);
+    const { ahead, behind } = gitAheadBehind(root, upstream);
+    if (behind > 0) {
+        if (currentVersion === latestVersion) {
+            process.stdout.write(`new GitHub update available for pi-remote ${currentVersion}: ${currentCommit} -> ${latestCommit}\n`);
+        }
+        else {
+            process.stdout.write(`new pi-remote version available: ${currentVersion} (${currentCommit}) -> ${latestVersion} (${latestCommit})\n`);
+        }
+        if (isGitDirty(root))
+            fail(`cannot update ${root}: working tree has uncommitted changes`);
+        runGitOrFail(root, ['pull', '--ff-only'], 'git pull');
+        process.stdout.write(`updated pi-remote to ${readPackageVersion(root)} (${gitShortCommit(root, 'HEAD')})\n`);
+        return;
+    }
+    if (ahead > 0) {
+        process.stdout.write(`no newer GitHub version found; local checkout is ahead by ${ahead} commit${ahead === 1 ? '' : 's'} (${currentVersion} ${currentCommit})\n`);
+    }
+    else {
+        process.stdout.write(`pi-remote is already up to date: ${currentVersion} (${currentCommit})\n`);
+    }
+}
+function removeDirectoryContents(root) {
+    const resolved = path.resolve(root);
+    if (resolved === path.parse(resolved).root)
+        fail(`refusing to update unsafe package root: ${resolved}`);
+    fs.mkdirSync(resolved, { recursive: true });
+    for (const entry of fs.readdirSync(resolved)) {
+        fs.rmSync(path.join(resolved, entry), { recursive: true, force: true });
+    }
+}
+function updateCopiedInstallFromGitHub(root) {
+    if (!commandExists('git'))
+        fail('git is required for --update');
+    const currentVersion = readPackageVersion(root);
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-remote-update-'));
+    try {
+        process.stdout.write(`fetching latest pi-remote from ${GITHUB_REPO}\n`);
+        const clone = run('git', ['clone', '--depth', '1', GITHUB_REPO, tempRoot], { stdio: 'inherit' });
+        if (clone.error)
+            fail(`git clone: ${clone.error.message}`);
+        if (clone.status !== 0)
+            fail('git clone failed');
+        const latestVersion = readPackageVersion(tempRoot);
+        const latestCommit = gitShortCommit(tempRoot, 'HEAD');
+        if (currentVersion === latestVersion) {
+            process.stdout.write(`no newer package version found on GitHub (current ${currentVersion}); refreshing latest GitHub copy (${latestCommit})\n`);
+        }
+        else {
+            process.stdout.write(`new pi-remote version available: ${currentVersion} -> ${latestVersion} (${latestCommit})\n`);
+        }
+        removeDirectoryContents(root);
+        for (const entry of fs.readdirSync(tempRoot)) {
+            fs.cpSync(path.join(tempRoot, entry), path.join(root, entry), { recursive: true, force: true, verbatimSymlinks: true });
+        }
+        process.stdout.write(`updated pi-remote from GitHub: ${latestVersion} (${latestCommit})\n`);
+    }
+    finally {
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+}
+function updateLocalInstall() {
+    const root = currentPackageRoot();
+    if (isGitCheckout(root))
+        updateGitCheckout(root);
+    else
+        updateCopiedInstallFromGitHub(root);
+}
 function installRemote(host) {
     const packageRoot = path.resolve(__dirname, '..');
     const distCli = path.join(packageRoot, 'dist/pi-remote.js');
@@ -1503,6 +1698,7 @@ function parseLocal(args) {
     const options = {
         host: env('PI_REMOTE_HOST') ?? (configHost || DEFAULT_HOST),
         install: false,
+        update: false,
         initConfig: false,
         serverArgs: [],
         needsTty: true,
@@ -1530,6 +1726,9 @@ function parseLocal(args) {
                 break;
             case '--install-remote':
                 options.install = true;
+                break;
+            case '--update':
+                options.update = true;
                 break;
             case '--init-config':
                 options.initConfig = true;
@@ -1624,6 +1823,10 @@ async function runLocal(args) {
     }
     if (options.install) {
         installRemote(options.host);
+        return;
+    }
+    if (options.update) {
+        updateLocalInstall();
         return;
     }
     if (options.needsTty && !process.stdin.isTTY)
