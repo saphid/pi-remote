@@ -58,6 +58,7 @@ pi-remote --agent claude --project my-project
 pi-remote --agent codex --project my-project
 pi-remote --project my-project --session review-agent --no-attach -- "Review this project"
 pi-remote --configure-tmux
+pi-remote --update
 pi-remote --saved-sessions
 pi-remote --saved-sessions --agent codex
 pi-remote --saved-sessions --saved-agent pi --list
@@ -66,11 +67,13 @@ pi-remote --list
 pi-remote --sessions my-project
 ```
 
-With no switches, `pi-remote` opens an interactive project menu. Active `tmux` sessions and saved Pi/Codex sessions whose working directory is under a project are nested under that project's folder row. Use ↑/↓ or `j`/`k` to move, ←/→ to expand or collapse a project, and Enter to choose a project, active session, or saved session.
+With no switches, `pi-remote` opens an interactive project menu. Active `tmux` sessions and saved Pi/Codex sessions whose working directory is under a project are nested under that project's folder row. Use ↑/↓ to move, type to filter by project name, Backspace/Ctrl+U to edit the filter, ←/→ to expand or collapse a project, and Enter to choose a project, active session, or saved session.
 
 `--saved-sessions` opens the same KittyLitter-style picker over persisted Pi/Codex sessions (`~/.pi/agent/sessions` and `~/.codex/sessions`) on the target host without showing projects. Selecting a saved session starts a deterministic tmux session such as `pi-remote-pi-019e...` and re-attaches that tmux session on later launches instead of starting a second agent process for the same saved session. `--kittylitter` is an alias.
 
 Use `--no-attach` from non-interactive automation. It starts the `tmux` session detached and prints an attach command. The same options are available through `pi-remote` and `pi-remote.sh`.
+
+Use `pi-remote --update` to fetch GitHub, report whether a newer version/commit is available, and update the current install. Git checkouts use `git pull --ff-only`; copied installs are refreshed from a fresh GitHub clone and become Git checkouts for future updates.
 
 ### Saved-session concurrency
 
