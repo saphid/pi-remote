@@ -1196,8 +1196,7 @@ build_project_tree_rows() {
   local saved_filter=${3:-all}
   local saved_limit=${4:-120}
   local name_filter=${5:-}
-  local name_filter_lower project_lower
-  name_filter_lower=$(printf '%s' "$name_filter" | tr '[:upper:]' '[:lower:]')
+  local restore_nocasematch=0
   local project count saved_count _recent total_count session saved_row agent modified sid path_field cwd title model created msg_count
   local saved_label_width cleanup_after=0 expandable is_expanded
   MENU_TYPES=()
@@ -1217,10 +1216,14 @@ build_project_tree_rows() {
   saved_label_width=$((saved_label_width - 6))
   (( saved_label_width < 36 )) && saved_label_width=36
 
+  if [[ -n "$name_filter" ]] && ! shopt -q nocasematch; then
+    restore_nocasematch=1
+    shopt -s nocasematch
+  fi
+
   while IFS=$'\t' read -r project count saved_count _recent; do
     [[ -n "$project" ]] || continue
-    project_lower=$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]')
-    if [[ -n "$name_filter_lower" && "$project_lower" != *"$name_filter_lower"* ]]; then
+    if [[ -n "$name_filter" && "$project" != *"$name_filter"* ]]; then
       continue
     fi
     count=${count:-0}
@@ -1275,6 +1278,8 @@ build_project_tree_rows() {
       done < <(awk -v project="$project" 'index($0, project "\t") == 1 { print substr($0, length(project) + 2) }' "$PROJECT_MENU_SAVED_TREE_FILE")
     fi
   done <"$PROJECT_MENU_PROJECT_ROWS_FILE"
+
+  (( restore_nocasematch )) && shopt -u nocasematch
 
   MENU_TYPES+=("create")
   MENU_PROJECTS+=("")

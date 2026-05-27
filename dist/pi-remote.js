@@ -1004,9 +1004,8 @@ function projectSessionSummary(activeCount, savedCount) {
         parts.push(`${savedCount} saved`);
     return parts.length ? parts.join(', ') : '0';
 }
-function projectMatchesFilter(project, filter) {
-    const needle = filter.trim().toLowerCase();
-    return !needle || project.toLowerCase().includes(needle);
+function projectMatchesFilter(project, filterNeedle) {
+    return !filterNeedle || project.toLowerCase().includes(filterNeedle);
 }
 function removeLastInputCharacter(value) {
     const chars = Array.from(value);
@@ -1048,8 +1047,9 @@ function buildProjectTreeSnapshot(root, savedFilter = 'all', savedLimit = 120) {
 function buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter = '') {
     const rows = [];
     const savedLabelWidth = Math.max(36, menuLabelWidth() - 6);
+    const filterNeedle = filter.trim().toLowerCase();
     for (const { project, count, savedCount, activeSessions, savedSessions } of snapshot.projects) {
-        if (!projectMatchesFilter(project, filter))
+        if (!projectMatchesFilter(project, filterNeedle))
             continue;
         const totalCount = count + savedCount;
         const isExpanded = totalCount > 0 && expandedContains(expanded, project);
