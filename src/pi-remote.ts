@@ -1,11 +1,11 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
 import { spawnSync } from 'node:child_process';
 
-const VERSION = '1.1.1';
+const VERSION = '1.1.2';
 const GITHUB_REPO = 'https://github.com/saphid/pi-remote.git';
 const REMOTE_PROJECT_PATH = '"$HOME/projects/pi-remote/pi-remote"';
 const REMOTE_LEGACY_PROJECT_PATH = '"$HOME/projects/pi-remote/pi-remote.sh"';
@@ -1589,7 +1589,7 @@ function installRemote(host: string): void {
     if (transfer.status !== 0) process.exit(transfer.status ?? 1);
   }
   const installScript = `set -e
-PATH="$HOME/.bun/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 export PATH
 if [ -d "$HOME/${targetDir}/.git" ] && command -v git >/dev/null 2>&1; then
   git -C "$HOME/${targetDir}" fetch --tags --prune origin >/dev/null 2>&1 || true
@@ -1604,14 +1604,10 @@ rm -f "$HOME/pi-remote.js.tmp" "$HOME/pi-remote.wrapper.tmp" "$HOME/pi-remote.sh
 if [ ! -f "$HOME/.config/pi-remote/config" ]; then
   printf '%s\n' 'project_root=~/projects' 'agent=pi' 'pi_command=pi' 'claude_command=claude' 'codex_command=codex' > "$HOME/.config/pi-remote/config"
 fi
-if ! command -v bun >/dev/null 2>&1 && ! command -v node >/dev/null 2>&1; then
-  if command -v curl >/dev/null 2>&1; then
-    printf '%s\n' 'pi-remote: installing Bun runtime (no slow shell fallback)'
-    curl -fsSL https://bun.sh/install | bash
-  else
-    printf '%s\n' 'pi-remote: install Bun or Node on the remote host; no slow shell fallback is available' >&2
-    exit 127
-  fi
+if ! command -v node >/dev/null 2>&1; then
+  printf '%s\n' 'pi-remote: Node.js is required on the remote host; no slow shell fallback is available' >&2
+  printf '%s\n' 'Install Node.js, then run pi-remote --install-remote again.' >&2
+  exit 127
 fi`;
   const installed = run('ssh', ['-o', 'BatchMode=yes', host, installScript], { stdio: 'inherit' });
   if (installed.status !== 0) process.exit(installed.status ?? 1);

@@ -6,25 +6,25 @@
 
 It ships with two entry points:
 
-- `pi-remote`: the TypeScript CLI, run with Bun or Node.
+- `pi-remote`: the TypeScript CLI, run with Node.js.
 - `pi-remote.sh`: a compatibility wrapper that delegates to the same TypeScript CLI.
 
 There is no slower shell-menu fallback. Both entry points use local OpenSSH plus remote Bash, remote `tmux`, and whichever agent command you want to run (`pi`, `claude`, `codex`, or a custom command).
 
 ## Install
 
-Install the TypeScript/Bun CLI globally from GitHub:
+Install the TypeScript/Node CLI globally from GitHub:
 
 ```bash
-bun install -g github:saphid/pi-remote
+npm install -g github:saphid/pi-remote
 ```
 
 Or install from a local checkout while developing:
 
 ```bash
-bun install
-bun run build
-bun link
+npm install
+npm run build
+npm link
 ```
 
 Create a local config for your SSH host:
@@ -39,7 +39,7 @@ Install or update the helper copy on the remote host:
 pi-remote --install-remote
 ```
 
-The remote helper is installed at `~/projects/pi-remote/pi-remote` and linked to `~/.local/bin/pi-remote`. A `pi-remote.sh` compatibility wrapper is installed too. If the remote host has neither Bun nor Node, `--install-remote` installs Bun so the interactive menus stay on the fast TypeScript path.
+The remote helper is installed at `~/projects/pi-remote/pi-remote` and linked to `~/.local/bin/pi-remote`. A `pi-remote.sh` compatibility wrapper is installed too. The remote host must have Node.js; there is no slower shell-menu fallback.
 
 ## Usage
 
