@@ -39,10 +39,10 @@ const os = __importStar(require("node:os"));
 const path = __importStar(require("node:path"));
 const readline = __importStar(require("node:readline"));
 const node_child_process_1 = require("node:child_process");
-const VERSION = '1.1.0';
+const VERSION = '1.1.1';
 const GITHUB_REPO = 'https://github.com/saphid/pi-remote.git';
-const REMOTE_PROJECT_PATH = '"$HOME/projects/pi-remote/pi-remote.sh"';
-const REMOTE_LEGACY_PROJECT_PATH = '"$HOME/projects/pi-remote/pi-remote"';
+const REMOTE_PROJECT_PATH = '"$HOME/projects/pi-remote/pi-remote"';
+const REMOTE_LEGACY_PROJECT_PATH = '"$HOME/projects/pi-remote/pi-remote.sh"';
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), '.config/pi-remote/config');
 const DEFAULT_HOST = 'pi-remote';
 process.stdout.on('error', (error) => {
@@ -1516,6 +1516,9 @@ function ensureParent(file) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
 }
 function currentPackageRoot() {
+    const configured = env('PI_REMOTE_PACKAGE_ROOT');
+    if (configured)
+        return path.resolve(expandHomePath(configured));
     return path.resolve(__dirname, '..');
 }
 function commandExists(command) {
@@ -1657,7 +1660,7 @@ function updateLocalInstall() {
         updateCopiedInstallFromGitHub(root);
 }
 function installRemote(host) {
-    const packageRoot = path.resolve(__dirname, '..');
+    const packageRoot = currentPackageRoot();
     const distCli = path.join(packageRoot, 'dist/pi-remote.js');
     const wrapper = path.join(packageRoot, 'pi-remote');
     const bashCli = path.join(packageRoot, 'pi-remote.sh');
@@ -1677,7 +1680,27 @@ function installRemote(host) {
         if (transfer.status !== 0)
             process.exit(transfer.status ?? 1);
     }
-    const installScript = `set -e; install -m 0755 "$HOME/pi-remote.js.tmp" "$HOME/${targetDir}/dist/pi-remote.js"; install -m 0755 "$HOME/pi-remote.wrapper.tmp" "$HOME/${targetDir}/pi-remote"; install -m 0755 "$HOME/pi-remote.sh.tmp" "$HOME/${targetDir}/pi-remote.sh"; ln -sf "$HOME/${targetDir}/pi-remote" "$HOME/.local/bin/pi-remote"; ln -sf "$HOME/${targetDir}/pi-remote.sh" "$HOME/.local/bin/pi-remote.sh"; rm -f "$HOME/pi-remote.js.tmp" "$HOME/pi-remote.wrapper.tmp" "$HOME/pi-remote.sh.tmp"; if [ ! -f "$HOME/.config/pi-remote/config" ]; then printf '%s\n' 'project_root=~/projects' 'agent=pi' 'pi_command=pi' 'claude_command=claude' 'codex_command=codex' > "$HOME/.config/pi-remote/config"; fi`;
+    const installScript = `set -e
+PATH="$HOME/.bun/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PATH
+install -m 0755 "$HOME/pi-remote.js.tmp" "$HOME/${targetDir}/dist/pi-remote.js"
+install -m 0755 "$HOME/pi-remote.wrapper.tmp" "$HOME/${targetDir}/pi-remote"
+install -m 0755 "$HOME/pi-remote.sh.tmp" "$HOME/${targetDir}/pi-remote.sh"
+ln -sf "$HOME/${targetDir}/pi-remote" "$HOME/.local/bin/pi-remote"
+ln -sf "$HOME/${targetDir}/pi-remote.sh" "$HOME/.local/bin/pi-remote.sh"
+rm -f "$HOME/pi-remote.js.tmp" "$HOME/pi-remote.wrapper.tmp" "$HOME/pi-remote.sh.tmp"
+if [ ! -f "$HOME/.config/pi-remote/config" ]; then
+  printf '%s\n' 'project_root=~/projects' 'agent=pi' 'pi_command=pi' 'claude_command=claude' 'codex_command=codex' > "$HOME/.config/pi-remote/config"
+fi
+if ! command -v bun >/dev/null 2>&1 && ! command -v node >/dev/null 2>&1; then
+  if command -v curl >/dev/null 2>&1; then
+    printf '%s\n' 'pi-remote: installing Bun runtime (no slow shell fallback)'
+    curl -fsSL https://bun.sh/install | bash
+  else
+    printf '%s\n' 'pi-remote: install Bun or Node on the remote host; no slow shell fallback is available' >&2
+    exit 127
+  fi
+fi`;
     const installed = run('ssh', ['-o', 'BatchMode=yes', host, installScript], { stdio: 'inherit' });
     if (installed.status !== 0)
         process.exit(installed.status ?? 1);

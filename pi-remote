@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 set -eu
-PATH="$HOME/.bun/bin:$HOME/.local/bin:$PATH"
+PATH="$HOME/.bun/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 export PATH
 SOURCE=$0
 while [ -L "$SOURCE" ]; do
@@ -12,7 +12,19 @@ while [ -L "$SOURCE" ]; do
   esac
 done
 DIR=$(CDPATH='' cd -P -- "$(dirname -- "$SOURCE")" && pwd)
-if command -v bun >/dev/null 2>&1 && [ -r "$DIR/dist/pi-remote.js" ]; then
-  exec bun "$DIR/dist/pi-remote.js" "$@"
+export PI_REMOTE_PACKAGE_ROOT=${PI_REMOTE_PACKAGE_ROOT:-$DIR}
+JS="$DIR/dist/pi-remote.js"
+if command -v bun >/dev/null 2>&1 && [ -r "$JS" ]; then
+  exec bun "$JS" "$@"
 fi
-exec "$DIR/pi-remote.sh" "$@"
+if command -v node >/dev/null 2>&1 && [ -r "$JS" ]; then
+  exec node "$JS" "$@"
+fi
+cat >&2 <<EOF
+pi-remote: Bun or Node is required; no slow shell fallback is available.
+Install Bun with:
+  curl -fsSL https://bun.sh/install | bash
+Then run:
+  pi-remote --update
+EOF
+exit 127

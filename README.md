@@ -4,12 +4,12 @@
 
 `pi-remote` is a small launcher for remote coding-agent sessions. It SSHes to a configured host, lets you pick or create a project under a remote project root, and starts or resumes a `tmux` session running your chosen agent CLI.
 
-It ships with two equivalent entry points:
+It ships with two entry points:
 
-- `pi-remote`: the TypeScript/Bun CLI.
-- `pi-remote.sh`: the Bash CLI.
+- `pi-remote`: the TypeScript CLI, run with Bun or Node.
+- `pi-remote.sh`: a compatibility wrapper that delegates to the same TypeScript CLI.
 
-Both entry points use local OpenSSH plus remote Bash, remote `tmux`, and whichever agent command you want to run (`pi`, `claude`, `codex`, or a custom command).
+There is no slower shell-menu fallback. Both entry points use local OpenSSH plus remote Bash, remote `tmux`, and whichever agent command you want to run (`pi`, `claude`, `codex`, or a custom command).
 
 ## Install
 
@@ -27,12 +27,6 @@ bun run build
 bun link
 ```
 
-Or install the Bash CLI directly:
-
-```bash
-install -m 0755 pi-remote.sh ~/.local/bin/pi-remote.sh
-```
-
 Create a local config for your SSH host:
 
 ```bash
@@ -45,7 +39,7 @@ Install or update the helper copy on the remote host:
 pi-remote --install-remote
 ```
 
-The Bash remote helper is installed at `~/projects/pi-remote/pi-remote.sh` and linked to `~/.local/bin/pi-remote.sh`. A `~/projects/pi-remote/pi-remote` wrapper is installed too; it uses the Bun implementation when available and falls back to `pi-remote.sh` otherwise.
+The remote helper is installed at `~/projects/pi-remote/pi-remote` and linked to `~/.local/bin/pi-remote`. A `pi-remote.sh` compatibility wrapper is installed too. If the remote host has neither Bun nor Node, `--install-remote` installs Bun so the interactive menus stay on the fast TypeScript path.
 
 ## Usage
 
