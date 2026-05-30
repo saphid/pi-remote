@@ -18,6 +18,7 @@ process.stdout.on('error', (error: any) => {
 });
 
 type MenuType = 'project' | 'session' | 'saved' | 'create' | 'quit';
+type ArchiveMode = 'visible' | 'include' | 'archived';
 type MenuRow = {
   type: MenuType;
   project: string;
@@ -26,10 +27,25 @@ type MenuRow = {
   saved?: SavedSession;
   expandable?: boolean;
   expanded?: boolean;
+  archived?: boolean;
 };
 type ProjectRow = { project: string; count: number; savedCount: number; recent: number };
 type ProjectTreeProject = ProjectRow & { activeSessions: string[]; savedSessions: SavedSession[] };
-type ProjectTreeSnapshot = { root: string; projects: ProjectTreeProject[] };
+type ArchiveKind = 'saved' | 'tmux';
+type ArchiveEntry = {
+  kind: ArchiveKind;
+  archivedAt: string;
+  agent?: SavedAgent;
+  id?: string;
+  path?: string;
+  cwd?: string;
+  title?: string;
+  projectRoot?: string;
+  project?: string;
+  session?: string;
+};
+type ArchiveStore = { version: 1; entries: Record<string, ArchiveEntry> };
+type ProjectTreeSnapshot = { root: string; projects: ProjectTreeProject[]; archive: ArchiveStore };
 type SavedAgent = 'pi' | 'codex';
 type SavedSession = {
   agent: SavedAgent;
@@ -41,6 +57,7 @@ type SavedSession = {
   created: string;
   modified: number;
   messageCount: number;
+  archived?: boolean;
 };
 type ServerOptions = {
   projectRoot: string;
@@ -57,6 +74,8 @@ type ServerOptions = {
   savedSessions: boolean;
   savedSessionLimit: number;
   savedAgent: string;
+  includeArchived: boolean;
+  archivedOnly: boolean;
   selectedSession: string;
   projectWasInteractive: boolean;
   agent: string;
@@ -95,11 +114,12 @@ Usage:
   pi-remote --update                       Pull/update this pi-remote install from GitHub, then exit
   pi-remote --saved-sessions               Pick a saved Pi/Codex session and attach in tmux
   pi-remote --saved-sessions --agent codex --list
+  pi-remote --saved-sessions --include-archived --list
   pi-remote --install-remote               Install/update the remote helper copy, then exit
   pi-remote --init-config --host HOST       Create a local config file, then exit
   pi-remote --list
 
-Interactive project menus use ↑/↓ to move, type to filter by project name, Backspace/Ctrl+U to edit the filter, ←/→ to expand projects, and Enter. Saved-session pickers also support j/k.
+Interactive project menus use ↑/↓ to move, type to filter by project name, Backspace/Ctrl+U to edit the filter, ←/→ to expand projects, Enter, Ctrl+A to archive the selected session, Ctrl+X to close it, and Ctrl+R to restore archived rows when shown with --include-archived. Saved-session pickers also support j/k.
 
 Options:
   --host HOST             SSH host to use (default: config host, PI_REMOTE_HOST, or pi-remote)
@@ -120,6 +140,8 @@ Options:
   --kittylitter           Alias for --saved-sessions
   --saved-agent NAME      Saved-session filter: all, pi, or codex (default: all)
   --saved-session-limit N Saved-session scan/list cap (default: 120)
+  --include-archived      Include archived tmux and saved sessions in menus/lists
+  --archived              Show only archived tmux and saved sessions in menus/lists
   --dry-run               Print what would run without creating/attaching tmux
   --project-root PATH     Remote project root (default: ~/projects)
   --pi-bin PATH           Pi executable on the remote host (default: pi; backwards-compatible alias)
@@ -148,6 +170,7 @@ Environment:
   PI_REMOTE_CODEX_BIN     Default Codex executable for server mode.
   PI_REMOTE_TMUX_CONFIG   Remote tmux config path (default: ~/.tmux.conf).
   PI_REMOTE_TMUX_CONFIG_SOURCE Set to 0 to write/validate config without sourcing it.
+  PI_REMOTE_ARCHIVE       Archive metadata path (default: ~/.cache/pi-remote/archive.json).
 
 Automation-friendly example:
   pi-remote --project my-project --session review-agent --no-attach -- "Review this project"
@@ -446,6 +469,114 @@ function recentFile(): string {
   return env('PI_REMOTE_RECENTS') ?? path.join(os.homedir(), '.cache/pi-remote/recents.tsv');
 }
 
+function archiveFile(): string {
+  return env('PI_REMOTE_ARCHIVE') ?? path.join(os.homedir(), '.cache/pi-remote/archive.json');
+}
+
+function emptyArchiveStore(): ArchiveStore {
+  return { version: 1, entries: {} };
+}
+
+function readArchiveStore(): ArchiveStore {
+  const file = archiveFile();
+  if (!fs.existsSync(file)) return emptyArchiveStore();
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<ArchiveStore>;
+    if (!parsed || typeof parsed !== 'object' || !parsed.entries || typeof parsed.entries !== 'object') return emptyArchiveStore();
+    const entries: Record<string, ArchiveEntry> = {};
+    for (const [key, entry] of Object.entries(parsed.entries)) {
+      if (!entry || typeof entry !== 'object') continue;
+      const kind = (entry as ArchiveEntry).kind;
+      if (kind !== 'saved' && kind !== 'tmux') continue;
+      entries[key] = { ...(entry as ArchiveEntry), kind, archivedAt: String((entry as ArchiveEntry).archivedAt || '') };
+    }
+    return { version: 1, entries };
+  } catch {
+    return emptyArchiveStore();
+  }
+}
+
+function writeArchiveStore(store: ArchiveStore): void {
+  const file = archiveFile();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify({ version: 1, entries: store.entries }, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(tmp, file);
+}
+
+function archiveKey(parts: string[]): string {
+  return JSON.stringify(parts);
+}
+
+function normalizedArchiveRoot(root: string): string {
+  return withoutTrailingSlashes(path.resolve(expandHomePath(root)));
+}
+
+function savedSessionArchiveKey(session: Pick<SavedSession, 'agent' | 'path'>): string {
+  return archiveKey(['saved', session.agent, path.resolve(expandHomePath(session.path))]);
+}
+
+function tmuxSessionArchiveKey(root: string, project: string, session: string): string {
+  return archiveKey(['tmux', normalizedArchiveRoot(root), project, session]);
+}
+
+function archiveModeFromOptions(options: Pick<ServerOptions, 'includeArchived' | 'archivedOnly'>): ArchiveMode {
+  if (options.archivedOnly) return 'archived';
+  return options.includeArchived ? 'include' : 'visible';
+}
+
+function shouldShowForArchiveMode(archived: boolean, mode: ArchiveMode): boolean {
+  if (mode === 'archived') return archived;
+  if (mode === 'include') return true;
+  return !archived;
+}
+
+function isSavedSessionArchived(store: ArchiveStore, session: Pick<SavedSession, 'agent' | 'path'>): boolean {
+  return Boolean(store.entries[savedSessionArchiveKey(session)]);
+}
+
+function isTmuxSessionArchived(store: ArchiveStore, root: string, project: string, session: string): boolean {
+  return Boolean(store.entries[tmuxSessionArchiveKey(root, project, session)]);
+}
+
+function archiveSavedSession(session: SavedSession): void {
+  const store = readArchiveStore();
+  store.entries[savedSessionArchiveKey(session)] = {
+    kind: 'saved',
+    archivedAt: new Date().toISOString(),
+    agent: session.agent,
+    id: session.id,
+    path: session.path,
+    cwd: session.cwd,
+    title: session.title,
+  };
+  writeArchiveStore(store);
+}
+
+function unarchiveSavedSession(session: SavedSession): void {
+  const store = readArchiveStore();
+  delete store.entries[savedSessionArchiveKey(session)];
+  writeArchiveStore(store);
+}
+
+function archiveTmuxSession(root: string, project: string, session: string): void {
+  const store = readArchiveStore();
+  store.entries[tmuxSessionArchiveKey(root, project, session)] = {
+    kind: 'tmux',
+    archivedAt: new Date().toISOString(),
+    projectRoot: normalizedArchiveRoot(root),
+    project,
+    session,
+  };
+  writeArchiveStore(store);
+}
+
+function unarchiveTmuxSession(root: string, project: string, session: string): void {
+  const store = readArchiveStore();
+  delete store.entries[tmuxSessionArchiveKey(root, project, session)];
+  writeArchiveStore(store);
+}
+
 function withoutTrailingSlashes(value: string): string {
   return value.replace(/\/+$/, '') || '/';
 }
@@ -455,21 +586,33 @@ function childPathPrefix(value: string): string {
   return normalized === '/' ? '/' : `${normalized}/`;
 }
 
-function listProjectSessions(projectDir: string): string[] {
+function projectNameFromDir(root: string, projectDir: string): string {
+  const relative = path.relative(path.resolve(root), path.resolve(projectDir));
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return path.basename(projectDir);
+  return relative.split(path.sep)[0] ?? '';
+}
+
+function listProjectSessions(projectDir: string, root = '', project = '', mode: ArchiveMode = 'visible', archive = readArchiveStore()): string[] {
   if (!runOk('tmux', ['-V'])) return [];
   const output = commandOutput('tmux', ['list-panes', '-a', '-F', '#{session_name}\t#{pane_current_path}\t#{pane_current_command}'], '');
   const normalizedProjectDir = withoutTrailingSlashes(projectDir);
   const prefix = childPathPrefix(projectDir);
+  const archiveRoot = root || path.dirname(projectDir);
+  const archiveProject = project || projectNameFromDir(archiveRoot, projectDir);
   const sessions = new Set<string>();
   for (const line of output.split(/\r?\n/)) {
     if (!line) continue;
     const [session, panePath] = line.split('\t');
-    if (panePath === normalizedProjectDir || panePath?.startsWith(prefix)) sessions.add(session);
+    if (!session) continue;
+    if (panePath === normalizedProjectDir || panePath?.startsWith(prefix)) {
+      const archived = archiveProject ? isTmuxSessionArchived(archive, archiveRoot, archiveProject, session) : false;
+      if (shouldShowForArchiveMode(archived, mode)) sessions.add(session);
+    }
   }
   return [...sessions].sort((a, b) => a.localeCompare(b));
 }
 
-function projectSessionsByProject(root: string): Map<string, string[]> {
+function projectSessionsByProject(root: string, mode: ArchiveMode = 'visible', archive = readArchiveStore()): Map<string, string[]> {
   const sessionsByProject = new Map<string, Set<string>>();
   if (!runOk('tmux', ['-V'])) return new Map();
   const output = commandOutput('tmux', ['list-panes', '-a', '-F', '#{session_name}\t#{pane_current_path}\t#{pane_current_command}'], '');
@@ -479,14 +622,16 @@ function projectSessionsByProject(root: string): Map<string, string[]> {
     if (!session || !panePath?.startsWith(prefix)) continue;
     const project = panePath.slice(prefix.length).split('/')[0];
     if (!project) continue;
+    const archived = isTmuxSessionArchived(archive, root, project, session);
+    if (!shouldShowForArchiveMode(archived, mode)) continue;
     if (!sessionsByProject.has(project)) sessionsByProject.set(project, new Set());
     sessionsByProject.get(project)?.add(session);
   }
   return new Map([...sessionsByProject.entries()].map(([project, sessions]) => [project, [...sessions].sort((a, b) => a.localeCompare(b))]));
 }
 
-function projectSessionCounts(root: string): Map<string, number> {
-  return new Map([...projectSessionsByProject(root).entries()].map(([project, sessions]) => [project, sessions.length]));
+function projectSessionCounts(root: string, mode: ArchiveMode = 'visible', archive = readArchiveStore()): Map<string, number> {
+  return new Map([...projectSessionsByProject(root, mode, archive).entries()].map(([project, sessions]) => [project, sessions.length]));
 }
 
 function projectRecentTimes(root: string): Map<string, number> {
@@ -711,18 +856,62 @@ function savedSessionFilter(options: ServerOptions): string {
   return options.savedAgent;
 }
 
-function listSavedSessionsForFilter(filter: string, limit: number): SavedSession[] {
+function savedAgentMatchesFilter(agent: SavedAgent, filter: string): boolean {
+  return filter === 'all' || filter === agent;
+}
+
+function maybeAddSavedSession(sessions: SavedSession[], seen: Set<string>, session: SavedSession | null, archive: ArchiveStore, mode: ArchiveMode): void {
+  if (!session) return;
+  const key = savedSessionArchiveKey(session);
+  if (seen.has(key)) return;
+  session.archived = isSavedSessionArchived(archive, session);
+  if (!shouldShowForArchiveMode(Boolean(session.archived), mode)) return;
+  seen.add(key);
+  sessions.push(session);
+}
+
+function parseArchivedSavedSession(entry: ArchiveEntry): SavedSession | null {
+  if (entry.kind !== 'saved' || !entry.path || (entry.agent !== 'pi' && entry.agent !== 'codex')) return null;
+  const session = entry.agent === 'pi' ? parsePiSavedSession(entry.path) : parseCodexSavedSession(entry.path);
+  if (!session) return null;
+  session.archived = true;
+  return session;
+}
+
+function archivedSavedSessionsForFilter(filter: string, archive: ArchiveStore): SavedSession[] {
   const sessions: SavedSession[] = [];
+  const seen = new Set<string>();
+  for (const entry of Object.values(archive.entries)) {
+    const session = parseArchivedSavedSession(entry);
+    if (!session || !savedAgentMatchesFilter(session.agent, filter)) continue;
+    const key = savedSessionArchiveKey(session);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    sessions.push(session);
+  }
+  sessions.sort((a, b) => b.modified - a.modified);
+  return sessions;
+}
+
+function listSavedSessionsForFilter(filter: string, limit: number, mode: ArchiveMode = 'visible', archive = readArchiveStore()): SavedSession[] {
+  if (mode === 'archived') return archivedSavedSessionsForFilter(filter, archive).slice(0, limit);
+
+  const sessions: SavedSession[] = [];
+  const seen = new Set<string>();
+  const scanLimit = mode === 'visible' ? Math.max(limit * 5, limit + 200) : limit;
   if (filter === 'all' || filter === 'pi') {
-    for (const file of newestJsonlFiles(path.join(os.homedir(), '.pi/agent/sessions'), limit)) {
-      const session = parsePiSavedSession(file);
-      if (session) sessions.push(session);
+    for (const file of newestJsonlFiles(path.join(os.homedir(), '.pi/agent/sessions'), scanLimit)) {
+      maybeAddSavedSession(sessions, seen, parsePiSavedSession(file), archive, mode);
     }
   }
   if (filter === 'all' || filter === 'codex') {
-    for (const file of newestJsonlFiles(path.join(os.homedir(), '.codex/sessions'), limit)) {
-      const session = parseCodexSavedSession(file);
-      if (session) sessions.push(session);
+    for (const file of newestJsonlFiles(path.join(os.homedir(), '.codex/sessions'), scanLimit)) {
+      maybeAddSavedSession(sessions, seen, parseCodexSavedSession(file), archive, mode);
+    }
+  }
+  if (mode === 'include') {
+    for (const session of archivedSavedSessionsForFilter(filter, archive)) {
+      maybeAddSavedSession(sessions, seen, session, archive, mode);
     }
   }
   sessions.sort((a, b) => b.modified - a.modified);
@@ -730,7 +919,7 @@ function listSavedSessionsForFilter(filter: string, limit: number): SavedSession
 }
 
 function listSavedSessions(options: ServerOptions): SavedSession[] {
-  return listSavedSessionsForFilter(savedSessionFilter(options), options.savedSessionLimit);
+  return listSavedSessionsForFilter(savedSessionFilter(options), options.savedSessionLimit, archiveModeFromOptions(options));
 }
 
 function projectNameForCwd(root: string, cwd: string): string {
@@ -742,9 +931,9 @@ function projectNameForCwd(root: string, cwd: string): string {
   return validateExistingName(project) ? project : '';
 }
 
-function savedSessionsByProject(root: string, filter: string, limit: number, projects = new Set(listProjects(root))): Map<string, SavedSession[]> {
+function savedSessionsByProject(root: string, filter: string, limit: number, projects = new Set(listProjects(root)), mode: ArchiveMode = 'visible', archive = readArchiveStore()): Map<string, SavedSession[]> {
   const byProject = new Map<string, SavedSession[]>();
-  for (const session of listSavedSessionsForFilter(filter, limit)) {
+  for (const session of listSavedSessionsForFilter(filter, limit, mode, archive)) {
     const project = projectNameForCwd(root, session.cwd);
     if (!project || !projects.has(project)) continue;
     if (!byProject.has(project)) byProject.set(project, []);
@@ -788,6 +977,41 @@ function fitLine(value: string, max: number): string {
   return clipEnd(value, max);
 }
 
+const TERMINAL_TITLE_MAX = 160;
+
+function cleanTerminalTitleText(value: string): string {
+  return value.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function terminalTitle(parts: string[]): string {
+  return clipEnd(parts.map(cleanTerminalTitleText).filter(Boolean).join(' · '), TERMINAL_TITLE_MAX);
+}
+
+function setTerminalTitle(title: string): void {
+  const safeTitle = terminalTitle([title]);
+  if (!safeTitle) return;
+  const sequence = `\x1b]0;${safeTitle}\x07`;
+  try {
+    fs.writeFileSync('/dev/tty', sequence);
+  } catch {
+    if (process.stdout.isTTY) process.stdout.write(sequence);
+  }
+}
+
+function projectTerminalTitle(projectName: string, agent: string, sessionName: string, explicitSession: boolean): string {
+  const detail = explicitSession && sessionName ? sessionName : agent;
+  return terminalTitle([projectName, detail]);
+}
+
+function savedSessionTerminalTitle(session: SavedSession, options: ServerOptions): string {
+  const projectName = projectNameForCwd(options.projectRoot, session.cwd);
+  const sessionTitle = cleanTerminalTitleText(session.title);
+  if (projectName && sessionTitle && sessionTitle !== '(untitled)') return terminalTitle([projectName, `${session.agent}: ${sessionTitle}`]);
+  if (projectName) return terminalTitle([projectName, session.agent]);
+  if (sessionTitle && sessionTitle !== '(untitled)') return terminalTitle([session.agent, sessionTitle]);
+  return terminalTitle([session.agent, path.basename(session.cwd) || session.id.slice(0, 12)]);
+}
+
 function terminalColumns(): number {
   const columns = process.stdout.columns;
   return columns && Number.isFinite(columns) ? Math.max(20, columns) : 80;
@@ -802,7 +1026,7 @@ function savedSessionLabel(session: SavedSession, maxWidth = 112): string {
   const cwdRaw = session.cwd.replace(os.homedir(), '~');
   const shortId = session.id.slice(0, 12);
   const prefix = `${session.agent.padEnd(5)} ${savedSessionAge(session.modified).padStart(5)}  `;
-  const suffix = `  ${shortId}`;
+  const suffix = session.archived ? `  ${shortId} archived` : `  ${shortId}`;
   const available = width - prefix.length - suffix.length - 2;
 
   if (available < 34) {
@@ -850,6 +1074,7 @@ function savedSessionCommand(session: SavedSession, explicitCommand: string, age
 
 async function attachSavedSession(session: SavedSession, options: ServerOptions): Promise<void> {
   const sessionName = sanitizeName(options.sessionName || savedTmuxSessionName(session));
+  const title = savedSessionTerminalTitle(session, options);
 
   if (sessionExists(sessionName)) {
     if (options.noAttach || options.dryRun) {
@@ -857,6 +1082,7 @@ async function attachSavedSession(session: SavedSession, options: ServerOptions)
       process.stdout.write(`attach with: ${attachCommand(sessionName)}\n`);
       return;
     }
+    setTerminalTitle(title);
     const attach = run('tmux', ['attach', '-t', sessionName], { stdio: 'inherit' });
     if (attach.error) fail(`failed to run tmux: ${attach.error.message}`);
     process.exit(attach.status ?? 1);
@@ -876,6 +1102,7 @@ async function attachSavedSession(session: SavedSession, options: ServerOptions)
     return;
   }
 
+  setTerminalTitle(title);
   const attached = run('tmux', ['new-session', '-s', sessionName, '-c', session.cwd, agentCommand], { stdio: 'inherit' });
   if (attached.error) fail(`failed to run tmux: ${attached.error.message}`);
   process.exit(attached.status ?? 1);
@@ -927,8 +1154,11 @@ function renderArrowMenu(prompt: string, selected: number, offset: number, visib
 
 function keyName(chunk: Buffer): string {
   const value = chunk.toString('utf8');
+  if (value === '\u0001') return 'ctrl-a';
   if (value === '\u0003') return 'ctrl-c';
+  if (value === '\u0012') return 'ctrl-r';
   if (value === '\u0015') return 'ctrl-u';
+  if (value === '\u0018') return 'ctrl-x';
   if (value === '\u007f' || value === '\b') return 'backspace';
   if (value === '\u001b') return 'escape';
   if (value === '\r' || value === '\n') return 'enter';
@@ -1011,11 +1241,12 @@ function projectTreePrompt(root: string, filter: string): string {
   return filter ? `${base} — filter: ${filter}` : base;
 }
 
-function buildProjectTreeSnapshot(root: string, savedFilter = 'all', savedLimit = 120): ProjectTreeSnapshot {
+function buildProjectTreeSnapshot(root: string, savedFilter = 'all', savedLimit = 120, mode: ArchiveMode = 'visible'): ProjectTreeSnapshot {
+  const archive = readArchiveStore();
   const projectNames = listProjects(root);
   const projectSet = new Set(projectNames);
-  const activeByProject = projectSessionsByProject(root);
-  const savedByProject = savedSessionsByProject(root, savedFilter, savedLimit, projectSet);
+  const activeByProject = projectSessionsByProject(root, mode, archive);
+  const savedByProject = savedSessionsByProject(root, savedFilter, savedLimit, projectSet, mode, archive);
   const recents = projectRecentTimes(root);
   const sortableRows = projectNames.map((project) => {
     const activeSessions = activeByProject.get(project) ?? [];
@@ -1034,7 +1265,7 @@ function buildProjectTreeSnapshot(root: string, savedFilter = 'all', savedLimit 
       savedSessions: savedByProject.get(project) ?? [],
     };
   });
-  return { root, projects };
+  return { root, projects, archive };
 }
 
 function buildProjectTreeRowsFromSnapshot(snapshot: ProjectTreeSnapshot, expanded: string, filter = ''): MenuRow[] {
@@ -1057,10 +1288,12 @@ function buildProjectTreeRowsFromSnapshot(snapshot: ProjectTreeSnapshot, expande
     });
     if (isExpanded) {
       for (const session of activeSessions) {
-        rows.push({ type: 'session', project, session, label: `    ● ${session}` });
+        const archived = isTmuxSessionArchived(snapshot.archive, snapshot.root, project, session);
+        rows.push({ type: 'session', project, session, archived, label: `    ● ${archived ? '[archived] ' : ''}${session}` });
       }
       for (const saved of savedSessions) {
-        rows.push({ type: 'saved', project, session: '', saved, label: `    ◷ ${savedSessionLabel(saved, savedLabelWidth)}` });
+        const archived = Boolean(saved.archived);
+        rows.push({ type: 'saved', project, session: '', saved, archived, label: `    ◷ ${archived ? '[archived] ' : ''}${savedSessionLabel(saved, savedLabelWidth)}` });
       }
     }
   }
@@ -1069,8 +1302,8 @@ function buildProjectTreeRowsFromSnapshot(snapshot: ProjectTreeSnapshot, expande
   return rows;
 }
 
-function buildProjectTreeRows(root: string, expanded: string, savedFilter = 'all', savedLimit = 120, filter = ''): MenuRow[] {
-  return buildProjectTreeRowsFromSnapshot(buildProjectTreeSnapshot(root, savedFilter, savedLimit), expanded, filter);
+function buildProjectTreeRows(root: string, expanded: string, savedFilter = 'all', savedLimit = 120, filter = '', mode: ArchiveMode = 'visible'): MenuRow[] {
+  return buildProjectTreeRowsFromSnapshot(buildProjectTreeSnapshot(root, savedFilter, savedLimit, mode), expanded, filter);
 }
 
 function projectTreeRowLabel(row: MenuRow, selected: boolean): string {
@@ -1095,7 +1328,11 @@ function projectTreeFooter(selected: number, rows: MenuRow[], filter = ''): stri
       ? `${position} ↑/↓ move  ←/→ expand/collapse  Enter new session${hint}`
       : `${position} ↑/↓ move  Enter new session${hint}`;
   }
-  if (current.type === 'session' || current.type === 'saved') return `${position} ↑/↓ move  Enter resume  ←/→ collapse project${hint}`;
+  if (current.type === 'session' || current.type === 'saved') {
+    const archiveHint = current.archived ? 'Ctrl+R restore' : 'Ctrl+A archive';
+    const closeHint = current.type === 'session' ? 'Ctrl+X close' : 'Ctrl+X close/archive';
+    return `${position} ↑/↓ move  Enter resume  ${archiveHint}  ${closeHint}  ←/→ collapse project${hint}`;
+  }
   return `${position} ↑/↓ move  Enter select${hint}`;
 }
 
@@ -1127,24 +1364,53 @@ async function pickProjectMenu(root: string, options: ServerOptions): Promise<{ 
   let selected = 0;
   let offset = 0;
   let filter = '';
+  let status = '';
   const savedFilter = savedSessionFilter(options);
-  const snapshot = buildProjectTreeSnapshot(root, savedFilter, options.savedSessionLimit);
+  const mode = archiveModeFromOptions(options);
+  let snapshot = buildProjectTreeSnapshot(root, savedFilter, options.savedSessionLimit, mode);
   let rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter);
   const visible = menuVisibleRows();
   const lines = visible + 2;
+  const prompt = () => status ? `${projectTreePrompt(root, filter)} — ${status}` : projectTreePrompt(root, filter);
+  const clampSelection = () => {
+    if (selected < 0) selected = rows.length - 1;
+    else if (selected >= rows.length) selected = 0;
+    if (selected < offset) offset = selected;
+    else if (selected >= offset + visible) offset = selected - visible + 1;
+    if (offset < 0) offset = 0;
+  };
   const rebuildRowsForFilter = () => {
     rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter);
     selected = 0;
     offset = 0;
   };
+  const rebuildSnapshot = (preferredProject = '') => {
+    snapshot = buildProjectTreeSnapshot(root, savedFilter, options.savedSessionLimit, mode);
+    rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter);
+    if (preferredProject) {
+      const projectIndex = rows.findIndex((row) => row.type === 'project' && row.project === preferredProject);
+      if (projectIndex >= 0) selected = projectIndex;
+    }
+    clampSelection();
+  };
+  const confirmAction = async (message: string) => {
+    if (process.stdin.isRaw) process.stdin.setRawMode(false);
+    process.stdout.write('\x1b[?25h\n');
+    const answer = await askLine(`${message} [y/N]: `);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdout.write('\x1b[?25l');
+    return /^(y|yes)$/i.test(answer.trim());
+  };
   process.stdin.setRawMode(true);
   process.stdin.resume();
   process.stdout.write('\x1b[?25l');
-  renderProjectTreeMenu(projectTreePrompt(root, filter), selected, offset, visible, rows, filter);
+  renderProjectTreeMenu(prompt(), selected, offset, visible, rows, filter);
   try {
     for (;;) {
       const key = await readKey();
       let redraw = false;
+      let clearBeforeRedraw = false;
       if (key === 'ctrl-c') process.exit(130);
       if (key === 'up') { selected -= 1; redraw = true; }
       else if (key === 'down') { selected += 1; redraw = true; }
@@ -1168,6 +1434,54 @@ async function pickProjectMenu(root: string, options: ServerOptions): Promise<{ 
           selected = Math.max(0, rows.findIndex((row) => row.type === 'project' && row.project === current.project));
           redraw = true;
         }
+      } else if (key === 'ctrl-a') {
+        const current = rows[selected];
+        if (current?.type === 'session') {
+          archiveTmuxSession(root, current.project, current.session);
+          status = `archived ${current.session}`;
+          rebuildSnapshot(current.project);
+          redraw = true;
+        } else if (current?.type === 'saved' && current.saved) {
+          archiveSavedSession(current.saved);
+          status = `archived ${current.saved.agent} ${current.saved.id.slice(0, 12)}`;
+          rebuildSnapshot(current.project);
+          redraw = true;
+        }
+      } else if (key === 'ctrl-r') {
+        const current = rows[selected];
+        if (current?.type === 'session') {
+          unarchiveTmuxSession(root, current.project, current.session);
+          status = `restored ${current.session}`;
+          rebuildSnapshot(current.project);
+          redraw = true;
+        } else if (current?.type === 'saved' && current.saved) {
+          unarchiveSavedSession(current.saved);
+          status = `restored ${current.saved.agent} ${current.saved.id.slice(0, 12)}`;
+          rebuildSnapshot(current.project);
+          redraw = true;
+        }
+      } else if (key === 'ctrl-x') {
+        const current = rows[selected];
+        if (current?.type === 'session') {
+          clearBeforeRedraw = true;
+          if (await confirmAction(`Close tmux session '${current.session}'? This kills the live process but leaves agent history files alone.`)) {
+            const closed = closeTmuxSession(current.session);
+            if (closed) unarchiveTmuxSession(root, current.project, current.session);
+            status = closed ? `closed ${current.session}` : `could not close ${current.session}`;
+            rebuildSnapshot(current.project);
+          }
+          redraw = true;
+        } else if (current?.type === 'saved' && current.saved) {
+          clearBeforeRedraw = true;
+          if (await confirmAction(`Close/archive saved ${current.saved.agent} session '${current.saved.id.slice(0, 12)}'? JSONL history is kept.`)) {
+            const tmuxName = savedTmuxSessionName(current.saved);
+            const closed = sessionExists(tmuxName) ? closeTmuxSession(tmuxName) : false;
+            archiveSavedSession(current.saved);
+            status = closed ? `closed ${tmuxName} and archived saved session` : 'archived saved session';
+            rebuildSnapshot(current.project);
+          }
+          redraw = true;
+        }
       } else if (isProjectFilterKey(key)) {
         filter += key;
         rebuildRowsForFilter();
@@ -1186,13 +1500,11 @@ async function pickProjectMenu(root: string, options: ServerOptions): Promise<{ 
         return { project: safeName, session: '', quit: false };
       }
       if (redraw) {
-        if (selected < 0) selected = rows.length - 1;
-        else if (selected >= rows.length) selected = 0;
-        if (selected < offset) offset = selected;
-        else if (selected >= offset + visible) offset = selected - visible + 1;
-        if (offset < 0) offset = 0;
-        process.stdout.write(`\x1b[${lines}A`);
-        renderProjectTreeMenu(projectTreePrompt(root, filter), selected, offset, visible, rows, filter);
+        clampSelection();
+        if (clearBeforeRedraw) process.stdout.write('\x1b[2J\x1b[H');
+        else process.stdout.write(`\x1b[${lines}A`);
+        renderProjectTreeMenu(prompt(), selected, offset, visible, rows, filter);
+        status = '';
       }
     }
   } finally {
@@ -1202,8 +1514,8 @@ async function pickProjectMenu(root: string, options: ServerOptions): Promise<{ 
   }
 }
 
-async function pickResumeSessionMenu(projectDir: string): Promise<string> {
-  const sessions = listProjectSessions(projectDir);
+async function pickResumeSessionMenu(projectDir: string, root = '', project = '', mode: ArchiveMode = 'visible'): Promise<string> {
+  const sessions = listProjectSessions(projectDir, root, project, mode);
   if (!sessions.length || !process.stdin.isTTY) return '';
   const choice = await arrowSelect(`Existing tmux sessions for ${projectDir} (↑/↓ or j/k, Enter)`, ['Start a new session', ...sessions.map((session) => `Resume ${session}`)]);
   if (!choice) return '';
@@ -1212,6 +1524,12 @@ async function pickResumeSessionMenu(projectDir: string): Promise<string> {
 
 function sessionExists(session: string): boolean {
   return runOk('tmux', ['has-session', '-t', session]);
+}
+
+function closeTmuxSession(session: string): boolean {
+  if (!sessionExists(session)) return false;
+  const result = run('tmux', ['kill-session', '-t', session]);
+  return result.status === 0;
 }
 
 function uniqueSessionName(base: string): string {
@@ -1272,6 +1590,8 @@ async function runServer(args: string[]): Promise<void> {
     savedSessions: false,
     savedSessionLimit: 120,
     savedAgent: 'all',
+    includeArchived: false,
+    archivedOnly: false,
     selectedSession: '',
     projectWasInteractive: false,
     agent: env('PI_REMOTE_AGENT') ?? (configuredAgent || 'pi'),
@@ -1293,6 +1613,8 @@ async function runServer(args: string[]): Promise<void> {
       case '--saved-agent': options.savedAgent = args[++index] ?? fail('--saved-agent requires all, pi, or codex'); break;
       case '--saved-session-limit': options.savedSessionLimit = parsePositiveIntegerOption('--saved-session-limit', args[++index]); break;
       case '--saved-sessions': case '--kittylitter': options.savedSessions = true; break;
+      case '--include-archived': options.includeArchived = true; break;
+      case '--archived': options.archivedOnly = true; options.includeArchived = true; break;
       case '--command': options.explicitCommand = args[++index] ?? fail('--command requires a shell command'); break;
       case '--project-root': options.projectRoot = args[++index] ?? fail('--project-root requires a path'); break;
       case '--pi-bin': options.explicitCommand = args[++index] ?? fail('--pi-bin requires a path'); options.agent = 'pi'; options.explicitAgent = true; break;
@@ -1310,6 +1632,8 @@ async function runServer(args: string[]): Promise<void> {
         else if (arg.startsWith('--agent=')) { options.agent = arg.slice('--agent='.length); options.explicitAgent = true; }
         else if (arg.startsWith('--saved-agent=')) options.savedAgent = arg.slice('--saved-agent='.length);
         else if (arg.startsWith('--saved-session-limit=')) options.savedSessionLimit = parsePositiveIntegerOption('--saved-session-limit', arg.slice('--saved-session-limit='.length));
+        else if (arg === '--include-archived') options.includeArchived = true;
+        else if (arg === '--archived') { options.archivedOnly = true; options.includeArchived = true; }
         else if (arg.startsWith('--command=')) options.explicitCommand = arg.slice('--command='.length);
         else if (arg.startsWith('--project-root=')) options.projectRoot = arg.slice('--project-root='.length);
         else if (arg.startsWith('--pi-bin=')) { options.explicitCommand = arg.slice('--pi-bin='.length); options.agent = 'pi'; options.explicitAgent = true; }
@@ -1346,7 +1670,9 @@ async function runServer(args: string[]): Promise<void> {
   }
 
   if (options.sessionsProject) {
-    printLines(listProjectSessions(projectDirFromArg(options.projectRoot, options.sessionsProject)));
+    const projectDir = projectDirFromArg(options.projectRoot, options.sessionsProject);
+    const project = projectNameFromDir(options.projectRoot, projectDir);
+    printLines(listProjectSessions(projectDir, options.projectRoot, project, archiveModeFromOptions(options)));
     return;
   }
 
@@ -1376,7 +1702,7 @@ async function runServer(args: string[]): Promise<void> {
     options.sessionName = options.selectedSession;
     options.explicitSession = true;
   } else if (!options.projectWasInteractive && !options.explicitSession && !options.noAttach && !options.dryRun) {
-    const resumeSession = await pickResumeSessionMenu(projectDir);
+    const resumeSession = await pickResumeSessionMenu(projectDir, options.projectRoot, options.projectName, archiveModeFromOptions(options));
     if (resumeSession) {
       options.sessionName = resumeSession;
       options.explicitSession = true;
@@ -1405,6 +1731,7 @@ async function runServer(args: string[]): Promise<void> {
       process.stdout.write(`attach with: ${attachCommand(options.sessionName)}\n`);
       return;
     }
+    setTerminalTitle(projectTerminalTitle(options.projectName, options.agent, options.sessionName, options.explicitSession));
     const attach = run('tmux', ['attach', '-t', options.sessionName], { stdio: 'inherit' });
     if (attach.error) fail(`failed to run tmux: ${attach.error.message}`);
     process.exit(attach.status ?? 1);
@@ -1417,6 +1744,7 @@ async function runServer(args: string[]): Promise<void> {
     return;
   }
 
+  setTerminalTitle(projectTerminalTitle(options.projectName, options.agent, options.sessionName, options.explicitSession));
   const attached = run('tmux', ['new-session', '-s', options.sessionName, '-c', projectDir, agentCommand], { stdio: 'inherit' });
   if (attached.error) fail(`failed to run tmux: ${attached.error.message}`);
   process.exit(attached.status ?? 1);
@@ -1658,6 +1986,7 @@ function parseLocal(args: string[]): LocalOptions {
       case '--saved-sessions': case '--kittylitter': options.doSavedSessions = true; options.serverArgs.push(arg); break;
       case '--saved-agent': options.serverArgs.push(arg, args[++index] ?? fail('--saved-agent requires all, pi, or codex')); break;
       case '--saved-session-limit': options.serverArgs.push(arg, args[++index] ?? fail('--saved-session-limit requires a number')); break;
+      case '--include-archived': case '--archived': options.serverArgs.push(arg); break;
       case '--no-attach': options.noAttach = true; options.serverArgs.push(arg); break;
       case '--list': options.doList = true; options.serverArgs.push(arg); break;
       case '--configure-tmux': options.configureTmux = true; options.serverArgs.push(arg); break;
@@ -1670,6 +1999,7 @@ function parseLocal(args: string[]): LocalOptions {
         else if (arg.startsWith('--new=')) { options.hasNew = true; options.serverArgs.push(arg); }
         else if (arg.startsWith('--sessions=')) { options.doSessions = true; options.serverArgs.push(arg); }
         else if (arg.startsWith('--saved-agent=') || arg.startsWith('--saved-session-limit=')) options.serverArgs.push(arg);
+        else if (arg === '--include-archived' || arg === '--archived') options.serverArgs.push(arg);
         else options.serverArgs.push(arg);
     }
   }

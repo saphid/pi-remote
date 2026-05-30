@@ -56,16 +56,21 @@ pi-remote --update
 pi-remote --saved-sessions
 pi-remote --saved-sessions --agent codex
 pi-remote --saved-sessions --saved-agent pi --list
+pi-remote --saved-sessions --include-archived --list
 pi-remote --host local --saved-sessions  # saved sessions on this machine
 pi-remote --list
 pi-remote --sessions my-project
 ```
 
-With no switches, `pi-remote` opens an interactive project menu. Active `tmux` sessions and saved Pi/Codex sessions whose working directory is under a project are nested under that project's folder row. Use ↑/↓ to move, type to filter by project name, Backspace/Ctrl+U to edit the filter, ←/→ to expand or collapse a project, and Enter to choose a project, active session, or saved session.
+With no switches, `pi-remote` opens an interactive project menu. Active `tmux` sessions and saved Pi/Codex sessions whose working directory is under a project are nested under that project's folder row. Use ↑/↓ to move, type to filter by project name, Backspace/Ctrl+U to edit the filter, ←/→ to expand or collapse a project, and Enter to choose a project, active session, or saved session. On a selected session row, Ctrl+A archives it (hides it from the default lists without moving/deleting history), Ctrl+X closes it, and Ctrl+R restores it when archived rows are shown with `--include-archived`.
 
-`--saved-sessions` opens the same KittyLitter-style picker over persisted Pi/Codex sessions (`~/.pi/agent/sessions` and `~/.codex/sessions`) on the target host without showing projects. Selecting a saved session starts a deterministic tmux session such as `pi-remote-pi-019e...` and re-attaches that tmux session on later launches instead of starting a second agent process for the same saved session. `--kittylitter` is an alias.
+`--saved-sessions` opens the same KittyLitter-style picker over persisted Pi/Codex sessions (`~/.pi/agent/sessions` and `~/.codex/sessions`) on the target host without showing projects. Selecting a saved session starts a deterministic tmux session such as `pi-remote-pi-019e...` and re-attaches that tmux session on later launches instead of starting a second agent process for the same saved session. `--kittylitter` is an alias. Archived saved sessions, including Pi team-up/subagent JSONL sessions, are hidden by default; use `--include-archived` or `--archived` to review them later.
 
 Use `--no-attach` from non-interactive automation. It starts the `tmux` session detached and prints an attach command. The same options are available through `pi-remote` and `pi-remote.sh`.
+
+Interactive attach/start modes emit a sanitized terminal title (OSC 0) before handing the TTY to `tmux`, so terminals such as CMUX can label the tab with the selected project/session instead of the generic `PI Remote` launcher name. Non-interactive modes such as `--dry-run`, `--no-attach`, `--list`, and `--sessions` do not emit title escape sequences.
+
+Archive metadata is stored separately at `~/.cache/pi-remote/archive.json` (override with `PI_REMOTE_ARCHIVE`). Archiving never moves or deletes the underlying tmux agent history or Pi/Codex JSONL files; closing an active tmux session only kills the live process.
 
 Use `pi-remote --update` to fetch GitHub, report whether a newer version/commit is available, and update the current install. Git checkouts use `git pull --ff-only`; copied installs are refreshed from a fresh GitHub clone and become Git checkouts for future updates.
 
@@ -102,6 +107,7 @@ PI_REMOTE_CLAUDE_BIN       Claude executable for server mode.
 PI_REMOTE_CODEX_BIN        Codex executable for server mode.
 PI_REMOTE_TMUX_CONFIG      Remote tmux config path (default: ~/.tmux.conf).
 PI_REMOTE_TMUX_CONFIG_SOURCE Set to 0 to write/validate tmux config without sourcing it.
+PI_REMOTE_ARCHIVE          Archive metadata path (default: ~/.cache/pi-remote/archive.json).
 ```
 
 ## Tmux config helper
