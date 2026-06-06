@@ -91,7 +91,7 @@ Usage:
   pi-remote --init-config --host HOST       Create a local config file, then exit
   pi-remote --list
 
-Interactive project menus use ↑/↓ to move, type to filter by project name, Backspace/Ctrl+U to edit the filter, ←/→ to expand projects, Enter, Ctrl+A to archive the selected session, Ctrl+X to close it, and Ctrl+R to restore archived rows when shown with --include-archived. Saved-session pickers also support j/k.
+Interactive project menus use ↑/↓ to move, type to filter by project name, Backspace/Ctrl+U to edit the filter, → to expand, ← to collapse, Shift+Enter to open a folder, Enter to select/start, Ctrl+A to archive the selected session, Ctrl+X to close it, and Ctrl+R to restore archived rows when shown with --include-archived. Saved-session pickers also support j/k.
 
 Options:
   --host HOST             SSH host to use (default: config host, PI_REMOTE_HOST, or pi-remote)
@@ -1298,6 +1298,8 @@ function keyName(chunk) {
         return 'escape';
     if (value === '\r' || value === '\n')
         return 'enter';
+    if (value === '\u001b[13;2u' || value === '\u001b[27;2;13~' || value === '\u001b\r' || value === '\u001b\n')
+        return 'shift-enter';
     if (value === '\u001b[A' || value === '\u001bOA')
         return 'up';
     if (value === '\u001b[B' || value === '\u001bOB')
@@ -1500,8 +1502,8 @@ function projectTreeFooter(selected, rows, filter = '') {
         return `${position} ↑/↓ move  Enter parent directory${hint}`;
     if (current.type === 'project') {
         return current.expandable
-            ? `${position} ↑/↓ move  ←/→ expand/collapse  Enter new session${hint}`
-            : `${position} ↑/↓ move  Enter new session${hint}`;
+            ? `${position} ↑/↓ move  → expand  ← collapse  Enter new session  Shift+Enter open folder${hint}`
+            : `${position} ↑/↓ move  Enter new session  Shift+Enter open folder${hint}`;
     }
     if (current.type === 'session' || current.type === 'saved') {
         const archiveHint = current.archived ? 'Ctrl+R restore' : 'Ctrl+A archive';
@@ -1544,7 +1546,7 @@ async function pickProjectMenu(root, options) {
     let currentRoot = root;
     let expanded = '|';
     let expandedItems = '|';
-    let selected = 0;
+    let selected = 1;
     let offset = 0;
     let filter = '';
     let status = '';
@@ -1569,7 +1571,7 @@ async function pickProjectMenu(root, options) {
     };
     const rebuildRowsForFilter = () => {
         rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter, expandedItems);
-        selected = 0;
+        selected = rows.length > 1 ? 1 : 0;
         offset = 0;
     };
     const rebuildSnapshot = (preferredProject = '') => {
@@ -1579,6 +1581,9 @@ async function pickProjectMenu(root, options) {
             const projectIndex = rows.findIndex((row) => row.type === 'project' && row.project === preferredProject);
             if (projectIndex >= 0)
                 selected = projectIndex;
+        }
+        else if (selected === 0 && rows.length > 1) {
+            selected = 1;
         }
         clampSelection();
     };
@@ -1627,25 +1632,35 @@ async function pickProjectMenu(root, options) {
             }
             else if (key === 'left' || key === 'right') {
                 const current = rows[selected];
+                const shouldExpand = key === 'right';
                 if (current?.type === 'session' && current.project && current.session) {
                     const itemKey = `${current.project}/tmux/${current.session}`;
-                    expandedItems = expandedContains(expandedItems, itemKey) ? expandedItems.replace(`|${itemKey}|`, '|') : `${expandedItems}${itemKey}|`;
-                    rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter, expandedItems);
-                    selected = Math.max(0, rows.findIndex((row) => row.type === 'session' && row.project === current.project && row.session === current.session));
-                    redraw = true;
+                    const isExpanded = expandedContains(expandedItems, itemKey);
+                    if (shouldExpand !== isExpanded) {
+                        expandedItems = shouldExpand ? `${expandedItems}${itemKey}|` : expandedItems.replace(`|${itemKey}|`, '|');
+                        rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter, expandedItems);
+                        selected = Math.max(0, rows.findIndex((row) => row.type === 'session' && row.project === current.project && row.session === current.session));
+                        redraw = true;
+                    }
                 }
                 else if (current?.type === 'saved' && current.project && current.saved) {
                     const itemKey = `${current.project}/saved/${current.saved.agent}/${current.saved.id}`;
-                    expandedItems = expandedContains(expandedItems, itemKey) ? expandedItems.replace(`|${itemKey}|`, '|') : `${expandedItems}${itemKey}|`;
-                    rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter, expandedItems);
-                    selected = Math.max(0, rows.findIndex((row) => row.type === 'saved' && row.project === current.project && row.saved?.id === current.saved?.id));
-                    redraw = true;
+                    const isExpanded = expandedContains(expandedItems, itemKey);
+                    if (shouldExpand !== isExpanded) {
+                        expandedItems = shouldExpand ? `${expandedItems}${itemKey}|` : expandedItems.replace(`|${itemKey}|`, '|');
+                        rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter, expandedItems);
+                        selected = Math.max(0, rows.findIndex((row) => row.type === 'saved' && row.project === current.project && row.saved?.id === current.saved?.id));
+                        redraw = true;
+                    }
                 }
                 else if (current && current.type === 'project' && current.project && current.expandable) {
-                    expanded = expandedContains(expanded, current.project) ? expanded.replace(`|${current.project}|`, '|') : `${expanded}${current.project}|`;
-                    rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter, expandedItems);
-                    selected = Math.max(0, rows.findIndex((row) => row.type === 'project' && row.project === current.project));
-                    redraw = true;
+                    const isExpanded = expandedContains(expanded, current.project);
+                    if (shouldExpand !== isExpanded) {
+                        expanded = shouldExpand ? `${expanded}${current.project}|` : expanded.replace(`|${current.project}|`, '|');
+                        rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter, expandedItems);
+                        selected = Math.max(0, rows.findIndex((row) => row.type === 'project' && row.project === current.project));
+                        redraw = true;
+                    }
                 }
             }
             else if (key === 'ctrl-a') {
@@ -1708,8 +1723,20 @@ async function pickProjectMenu(root, options) {
                 rebuildRowsForFilter();
                 redraw = true;
             }
-            else if (key === 'enter') {
+            else if (key === 'enter' || key === 'shift-enter') {
                 const current = rows[selected];
+                if (key === 'shift-enter' && current.type === 'project') {
+                    currentRoot = path.join(currentRoot, current.project);
+                    expanded = '|';
+                    expandedItems = '|';
+                    filter = '';
+                    status = `root ${currentRoot}`;
+                    rebuildSnapshot();
+                    selected = rows.length > 1 ? 1 : 0;
+                    offset = 0;
+                    redraw = true;
+                    continue;
+                }
                 if (current.type === 'parent') {
                     currentRoot = path.dirname(currentRoot);
                     expanded = '|';
@@ -1717,7 +1744,7 @@ async function pickProjectMenu(root, options) {
                     filter = '';
                     status = `root ${currentRoot}`;
                     rebuildSnapshot();
-                    selected = 0;
+                    selected = rows.length > 1 ? 1 : 0;
                     offset = 0;
                     redraw = true;
                     continue;
