@@ -1100,8 +1100,41 @@ function clipStart(value: string, max: number): string {
   return `…${chars.slice(chars.length - max + 1).join('')}`;
 }
 
+const ANSI_PATTERN = /\x1b\[[0-?]*[ -/]*[@-~]/g;
+const HAS_ANSI_PATTERN = /\x1b\[[0-?]*[ -/]*[@-~]/;
+
+function visibleLength(value: string): number {
+  return Array.from(oneLine(value).replace(ANSI_PATTERN, '')).length;
+}
+
+function clipEndAnsi(value: string, max: number): string {
+  const clean = oneLine(value);
+  if (max <= 0) return '';
+  if (visibleLength(clean) <= max) return clean;
+  const target = max === 1 ? 0 : max - 1;
+  let visible = 0;
+  let out = '';
+  let index = 0;
+  for (const match of clean.matchAll(ANSI_PATTERN)) {
+    const ansiIndex = match.index ?? 0;
+    for (const char of Array.from(clean.slice(index, ansiIndex))) {
+      if (visible >= target) return `${out}${max === 1 ? '…' : '…'}\x1b[0m`;
+      out += char;
+      visible += 1;
+    }
+    out += match[0];
+    index = ansiIndex + match[0].length;
+  }
+  for (const char of Array.from(clean.slice(index))) {
+    if (visible >= target) return `${out}${max === 1 ? '…' : '…'}\x1b[0m`;
+    out += char;
+    visible += 1;
+  }
+  return `${out}\x1b[0m`;
+}
+
 function fitLine(value: string, max: number): string {
-  return clipEnd(value, max);
+  return HAS_ANSI_PATTERN.test(value) ? clipEndAnsi(value, max) : clipEnd(value, max);
 }
 
 const TERMINAL_TITLE_MAX = 160;
