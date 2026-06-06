@@ -1,6 +1,6 @@
 {
   "name": "pi-remote",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "Tiny SSH/tmux launcher for remote coding-agent sessions, packaged for Node.js.",
   "bin": {
     "pi-remote": "dist/pi-remote.js",

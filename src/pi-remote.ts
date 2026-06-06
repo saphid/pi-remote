@@ -1474,7 +1474,7 @@ function buildProjectTreeRowsFromSnapshot(snapshot: ProjectTreeSnapshot, expande
         rows.push({ type: 'session', project, session: tmux.name, tmux, saved, archived, expandable: true, expanded: itemExpanded, label: `    ${itemExpanded ? '▾' : '▸'} ● ${archived ? '[archived] ' : ''}${tmuxSessionLabel(tmux, saved, savedLabelWidth)}` });
         if (itemExpanded) {
           for (const detail of tmuxSessionDetails(tmux, saved, savedLabelWidth)) rows.push({ type: 'detail', project, session: tmux.name, label: detail });
-          rows.push({ type: 'terminate', project, session: tmux.name, label: '      Terminate tmux session' });
+          rows.push({ type: 'terminate', project, session: tmux.name, label: '      ⚠ TERMINATE tmux session — destructive action' });
         }
       }
       for (const saved of savedSessions) {
@@ -1538,8 +1538,10 @@ function renderProjectTreeMenu(prompt: string, selected: number, offset: number,
   for (let row = 0; row < visible; row += 1) {
     const index = offset + row;
     if (index < rows.length) {
-      const label = fitLine(projectTreeRowLabel(rows[index], index === selected), labelWidth);
-      process.stdout.write(index === selected ? `\x1b[K\x1b[7m› ${label}\x1b[0m\n` : `\x1b[K  ${label}\n`);
+      const rowItem = rows[index];
+      const label = fitLine(projectTreeRowLabel(rowItem, index === selected), labelWidth);
+      if (index === selected && rowItem.type === 'terminate') process.stdout.write(`\x1b[K\x1b[41;97;1m! ${label}\x1b[0m\n`);
+      else process.stdout.write(index === selected ? `\x1b[K\x1b[7m› ${label}\x1b[0m\n` : `\x1b[K  ${label}\n`);
     } else {
       process.stdout.write('\x1b[K\n');
     }
