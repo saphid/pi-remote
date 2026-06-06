@@ -738,10 +738,23 @@ function tmuxSessionLabel(session: TmuxSession, saved?: SavedSession, maxWidth =
   return fitLine(`${prefix}${clipEnd(summary, Math.max(8, available))}${suffix}`, width);
 }
 
+function formatDateTime(value: Date): string {
+  const pad = (part: number) => String(part).padStart(2, '0');
+  return `${value.getFullYear()}/${pad(value.getMonth() + 1)}/${pad(value.getDate())} ${pad(value.getHours())}:${pad(value.getMinutes())}`;
+}
+
+function formatUnixDateTime(seconds: number): string {
+  return seconds > 0 ? formatDateTime(new Date(seconds * 1000)) : 'unknown';
+}
+
+function formatMsDateTime(ms: number): string {
+  return ms > 0 ? formatDateTime(new Date(ms)) : 'unknown';
+}
+
 function tmuxSessionDetails(session: TmuxSession, saved?: SavedSession, maxWidth = 112): string[] {
-  const active = session.activity ? new Date(session.activity * 1000).toLocaleString() : 'unknown';
-  const created = session.created ? new Date(session.created * 1000).toLocaleString() : 'unknown';
-  const connected = session.lastAttached ? new Date(session.lastAttached * 1000).toLocaleString() : (session.attached ? 'currently attached' : 'unknown');
+  const active = formatUnixDateTime(session.activity);
+  const created = formatUnixDateTime(session.created);
+  const connected = session.lastAttached ? formatUnixDateTime(session.lastAttached) : (session.attached ? 'currently attached' : 'unknown');
   const summary = saved?.title && saved.title !== '(untitled)' ? saved.title : session.title || '(no summary available)';
   return [
     fitLine(`      summary: ${summary}`, maxWidth),
@@ -753,7 +766,7 @@ function tmuxSessionDetails(session: TmuxSession, saved?: SavedSession, maxWidth
 
 function savedSessionDetails(session: SavedSession, maxWidth = 112): string[] {
   const cwdRaw = session.cwd.replace(os.homedir(), '~');
-  const modified = session.modified ? new Date(session.modified).toLocaleString() : 'unknown';
+  const modified = formatMsDateTime(session.modified);
   return [
     fitLine(`      title: ${session.title || '(untitled)'}`, maxWidth),
     fitLine(`      cwd: ${cwdRaw}`, maxWidth),
@@ -1506,7 +1519,7 @@ function projectTreeFooter(selected: number, rows: MenuRow[], filter = ''): stri
   }
   if (current.type === 'session' || current.type === 'saved') {
     const archiveHint = current.archived ? 'Ctrl+R restore' : 'Ctrl+A archive';
-    const closeHint = current.type === 'session' ? 'Ctrl+X close' : 'Ctrl+X close/archive';
+    const closeHint = current.type === 'session' ? 'Ctrl+T terminate' : 'Ctrl+X close/archive';
     const detailHint = '  ←/→ details';
     return `${position} ↑/↓ move  Enter resume${detailHint}  ${archiveHint}  ${closeHint}${hint}`;
   }
@@ -1650,18 +1663,18 @@ async function pickProjectMenu(root: string, options: ServerOptions): Promise<{ 
           rebuildSnapshot(current.project);
           redraw = true;
         }
-      } else if (key === 'ctrl-x') {
+      } else if (key === 'ctrl-x' || key === 'ctrl-t') {
         const current = rows[selected];
         if (current?.type === 'session') {
           clearBeforeRedraw = true;
-          if (await confirmAction(`Close tmux session '${current.session}'? This kills the live process but leaves agent history files alone.`)) {
+          if (await confirmAction(`Terminate tmux session '${current.session}'? This kills the live process but leaves agent history files alone.`)) {
             const closed = closeTmuxSession(current.session);
             if (closed) unarchiveTmuxSession(root, current.project, current.session);
-            status = closed ? `closed ${current.session}` : `could not close ${current.session}`;
+            status = closed ? `terminated ${current.session}` : `could not terminate ${current.session}`;
             rebuildSnapshot(current.project);
           }
           redraw = true;
-        } else if (current?.type === 'saved' && current.saved) {
+        } else if (key === 'ctrl-x' && current?.type === 'saved' && current.saved) {
           clearBeforeRedraw = true;
           if (await confirmAction(`Close/archive saved ${current.saved.agent} session '${current.saved.id.slice(0, 12)}'? JSONL history is kept.`)) {
             const tmuxName = savedTmuxSessionName(current.saved);
