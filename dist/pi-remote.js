@@ -1417,7 +1417,7 @@ function buildProjectTreeSnapshot(root, savedFilter = 'all', savedLimit = 120, m
     return { root, projects, archive };
 }
 function buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter = '', expandedItems = '|') {
-    const rows = [];
+    const rows = [{ type: 'parent', project: '', session: '', label: '..' }];
     const savedLabelWidth = Math.max(36, menuLabelWidth() - 6);
     const filterNeedle = filter.trim().toLowerCase();
     for (const { project, count, savedCount, activeSessions, savedSessions } of snapshot.projects) {
@@ -1496,6 +1496,8 @@ function projectTreeFooter(selected, rows, filter = '') {
     const hint = projectTreeFilterHint(filter);
     if (!current)
         return `${position} ↑/↓ move  Enter select${hint}`;
+    if (current.type === 'parent')
+        return `${position} ↑/↓ move  Enter parent directory${hint}`;
     if (current.type === 'project') {
         return current.expandable
             ? `${position} ↑/↓ move  ←/→ expand/collapse  Enter new session${hint}`
@@ -1539,6 +1541,7 @@ function askLine(prompt) {
 async function pickProjectMenu(root, options) {
     if (!process.stdin.isTTY)
         fail('interactive project menu needs a TTY; pass --project NAME or --new NAME for non-interactive use');
+    let currentRoot = root;
     let expanded = '|';
     let expandedItems = '|';
     let selected = 0;
@@ -1547,11 +1550,11 @@ async function pickProjectMenu(root, options) {
     let status = '';
     const savedFilter = savedSessionFilter(options);
     const mode = archiveModeFromOptions(options);
-    let snapshot = buildProjectTreeSnapshot(root, savedFilter, options.savedSessionLimit, mode);
+    let snapshot = buildProjectTreeSnapshot(currentRoot, savedFilter, options.savedSessionLimit, mode);
     let rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter, expandedItems);
     const visible = menuVisibleRows();
     const lines = visible + 2;
-    const prompt = () => status ? `${projectTreePrompt(root, filter)} — ${status}` : projectTreePrompt(root, filter);
+    const prompt = () => status ? `${projectTreePrompt(currentRoot, filter)} — ${status}` : projectTreePrompt(currentRoot, filter);
     const clampSelection = () => {
         if (selected < 0)
             selected = rows.length - 1;
@@ -1570,7 +1573,7 @@ async function pickProjectMenu(root, options) {
         offset = 0;
     };
     const rebuildSnapshot = (preferredProject = '') => {
-        snapshot = buildProjectTreeSnapshot(root, savedFilter, options.savedSessionLimit, mode);
+        snapshot = buildProjectTreeSnapshot(currentRoot, savedFilter, options.savedSessionLimit, mode);
         rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter, expandedItems);
         if (preferredProject) {
             const projectIndex = rows.findIndex((row) => row.type === 'project' && row.project === preferredProject);
@@ -1648,7 +1651,7 @@ async function pickProjectMenu(root, options) {
             else if (key === 'ctrl-a') {
                 const current = rows[selected];
                 if (current?.type === 'session') {
-                    archiveTmuxSession(root, current.project, current.session);
+                    archiveTmuxSession(currentRoot, current.project, current.session);
                     status = `archived ${current.session}`;
                     rebuildSnapshot(current.project);
                     redraw = true;
@@ -1663,7 +1666,7 @@ async function pickProjectMenu(root, options) {
             else if (key === 'ctrl-r') {
                 const current = rows[selected];
                 if (current?.type === 'session') {
-                    unarchiveTmuxSession(root, current.project, current.session);
+                    unarchiveTmuxSession(currentRoot, current.project, current.session);
                     status = `restored ${current.session}`;
                     rebuildSnapshot(current.project);
                     redraw = true;
@@ -1682,7 +1685,7 @@ async function pickProjectMenu(root, options) {
                     if (await confirmAction(`Terminate tmux session '${current.session}'? This kills the live process but leaves agent history files alone.`)) {
                         const closed = closeTmuxSession(current.session);
                         if (closed)
-                            unarchiveTmuxSession(root, current.project, current.session);
+                            unarchiveTmuxSession(currentRoot, current.project, current.session);
                         status = closed ? `terminated ${current.session}` : `could not terminate ${current.session}`;
                         rebuildSnapshot(current.project);
                     }
@@ -1707,20 +1710,32 @@ async function pickProjectMenu(root, options) {
             }
             else if (key === 'enter') {
                 const current = rows[selected];
+                if (current.type === 'parent') {
+                    currentRoot = path.dirname(currentRoot);
+                    expanded = '|';
+                    expandedItems = '|';
+                    filter = '';
+                    status = `root ${currentRoot}`;
+                    rebuildSnapshot();
+                    selected = 0;
+                    offset = 0;
+                    redraw = true;
+                    continue;
+                }
                 if (current.type === 'project')
-                    return { project: current.project, session: '', quit: false };
+                    return { root: currentRoot, project: current.project, session: '', quit: false };
                 if (current.type === 'session')
-                    return { project: current.project, session: current.session, quit: false };
+                    return { root: currentRoot, project: current.project, session: current.session, quit: false };
                 if (current.type === 'saved' && current.saved)
-                    return { project: '', session: '', quit: false, saved: current.saved };
+                    return { root: currentRoot, project: '', session: '', quit: false, saved: current.saved };
                 if (current.type === 'quit')
-                    return { project: '', session: '', quit: true };
+                    return { root: currentRoot, project: '', session: '', quit: true };
                 if (current.type === 'terminate') {
                     clearBeforeRedraw = true;
                     if (await confirmAction(`Terminate tmux session '${current.session}'? This kills the live process but leaves agent history files alone.`)) {
                         const closed = closeTmuxSession(current.session);
                         if (closed)
-                            unarchiveTmuxSession(root, current.project, current.session);
+                            unarchiveTmuxSession(currentRoot, current.project, current.session);
                         status = closed ? `terminated ${current.session}` : `could not terminate ${current.session}`;
                         rebuildSnapshot(current.project);
                     }
@@ -1735,8 +1750,8 @@ async function pickProjectMenu(root, options) {
                 process.stdout.write('\x1b[?25h\n');
                 const newName = await askLine('New project name: ');
                 const safeName = sanitizeName(newName);
-                fs.mkdirSync(path.join(root, safeName), { recursive: true });
-                return { project: safeName, session: '', quit: false };
+                fs.mkdirSync(path.join(currentRoot, safeName), { recursive: true });
+                return { root: currentRoot, project: safeName, session: '', quit: false };
             }
             if (redraw) {
                 clampSelection();
@@ -2000,6 +2015,7 @@ async function runServer(args) {
     }
     else {
         const selection = await pickProjectMenu(options.projectRoot, options);
+        options.projectRoot = selection.root;
         if (selection.quit)
             return;
         if (selection.saved) {
