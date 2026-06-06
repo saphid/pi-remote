@@ -5,8 +5,9 @@ import * as path from 'node:path';
 import * as readline from 'node:readline';
 import { spawnSync } from 'node:child_process';
 
-const VERSION = '1.1.2';
 const GITHUB_REPO = 'https://github.com/saphid/pi-remote.git';
+const GITHUB_DISPLAY_URL = 'https://github.com/saphid/pi-remote';
+const AUTHOR = 'Alex Southwell';
 const REMOTE_PROJECT_PATH = '"$HOME/projects/pi-remote/pi-remote"';
 const REMOTE_LEGACY_PROJECT_PATH = '"$HOME/projects/pi-remote/pi-remote.sh"';
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), '.config/pi-remote/config');
@@ -17,7 +18,7 @@ process.stdout.on('error', (error: any) => {
   throw error;
 });
 
-type MenuType = 'project' | 'session' | 'saved' | 'create' | 'quit';
+type MenuType = 'project' | 'session' | 'saved' | 'detail' | 'create' | 'quit';
 type ArchiveMode = 'visible' | 'include' | 'archived';
 type MenuRow = {
   type: MenuType;
@@ -25,12 +26,25 @@ type MenuRow = {
   session: string;
   label: string;
   saved?: SavedSession;
+  tmux?: TmuxSession;
   expandable?: boolean;
   expanded?: boolean;
   archived?: boolean;
 };
 type ProjectRow = { project: string; count: number; savedCount: number; recent: number };
-type ProjectTreeProject = ProjectRow & { activeSessions: string[]; savedSessions: SavedSession[] };
+type TmuxSession = {
+  name: string;
+  cwd: string;
+  command: string;
+  title: string;
+  created: number;
+  activity: number;
+  windows: number;
+  panes: number;
+  attached: number;
+  lastAttached: number;
+};
+type ProjectTreeProject = ProjectRow & { activeSessions: TmuxSession[]; savedSessions: SavedSession[] };
 type ArchiveKind = 'saved' | 'tmux';
 type ArchiveEntry = {
   kind: ArchiveKind;
@@ -101,8 +115,31 @@ type LocalOptions = {
   doSavedSessions: boolean;
 };
 
+function packageVersion(): string {
+  const candidates = [
+    path.join(__dirname, '..', 'package.json'),
+    path.join(__dirname, '..', '..', 'package.json'),
+  ];
+  for (const file of candidates) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as { version?: unknown };
+      if (typeof parsed.version === 'string' && parsed.version) return parsed.version;
+    } catch {}
+  }
+  return '0.0.0-dev';
+}
+
+function color(text: string, code: string): string {
+  return process.stdout.isTTY ? `\x1b[${code}m${text}\x1b[0m` : text;
+}
+
+function splashLine(): string {
+  return `${color('pi-remote', '1;36')} ${color(`v${packageVersion()}`, '1;33')} ${color('|', '2')} ${color(GITHUB_DISPLAY_URL, '4;34')} ${color('|', '2')} ${color(AUTHOR, '1;35')}`;
+}
+
 function usage(): void {
-  process.stdout.write(`pi-remote - tiny SSH/tmux launcher for coding agents on a remote host
+  process.stdout.write(`${splashLine()}
+pi-remote - tiny SSH/tmux launcher for coding agents on a remote host
 
 Usage:
   pi-remote                                SSH to the configured host, pick/create a project, attach in tmux
@@ -249,6 +286,30 @@ function run(command: string, args: string[], options: { cwd?: string; input?: s
 function runOk(command: string, args: string[], options: { cwd?: string; input?: string; stdio?: 'inherit' | 'ignore' } = {}): boolean {
   const result = run(command, args, options);
   return result.status === 0;
+}
+
+function restoreTerminal(): void {
+  // If ssh/tmux disappears while an agent TUI is in raw/alternate-screen mode,
+  // the local terminal can be left with hidden cursor, no echo, or broken line
+  // discipline. Best-effort reset before printing pi-remote prompts/errors.
+  if (!process.stdin.isTTY && !process.stdout.isTTY) return;
+  try { run('stty', ['sane'], { stdio: 'ignore' }); } catch {}
+  try {
+    process.stdout.write('\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[0m\x1b[?1049l\r\n');
+  } catch {}
+}
+
+function askYesNo(prompt: string, defaultYes = true): Promise<boolean> {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const suffix = defaultYes ? ' [Y/n] ' : ' [y/N] ';
+    rl.question(`${prompt}${suffix}`, (answer) => {
+      rl.close();
+      const normalized = answer.trim().toLowerCase();
+      if (!normalized) resolve(defaultYes);
+      else resolve(normalized === 'y' || normalized === 'yes');
+    });
+  });
 }
 
 function commandOutput(command: string, args: string[], fallback = ''): string {
@@ -612,26 +673,92 @@ function listProjectSessions(projectDir: string, root = '', project = '', mode: 
   return [...sessions].sort((a, b) => a.localeCompare(b));
 }
 
-function projectSessionsByProject(root: string, mode: ArchiveMode = 'visible', archive = readArchiveStore()): Map<string, string[]> {
-  const sessionsByProject = new Map<string, Set<string>>();
+function projectSessionsByProject(root: string, mode: ArchiveMode = 'visible', archive = readArchiveStore()): Map<string, TmuxSession[]> {
+  const sessionsByProject = new Map<string, Map<string, TmuxSession>>();
   if (!runOk('tmux', ['-V'])) return new Map();
-  const output = commandOutput('tmux', ['list-panes', '-a', '-F', '#{session_name}\t#{pane_current_path}\t#{pane_current_command}'], '');
+  const meta = new Map<string, Partial<TmuxSession>>();
+  const sessionOutput = commandOutput('tmux', ['list-sessions', '-F', '#{session_name}\t#{session_created}\t#{session_activity}\t#{session_windows}\t#{session_attached}\t#{session_last_attached}'], '');
+  for (const line of sessionOutput.split(/\r?\n/)) {
+    if (!line) continue;
+    const [name, created = '0', activity = '0', windows = '0', attached = '0', lastAttached = '0'] = line.split('\t');
+    if (name) meta.set(name, { created: Number(created) || 0, activity: Number(activity) || 0, windows: Number(windows) || 0, attached: Number(attached) || 0, lastAttached: Number(lastAttached) || 0 });
+  }
+  const output = commandOutput('tmux', ['list-panes', '-a', '-F', '#{session_name}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_title}'], '');
   const prefix = childPathPrefix(root);
   for (const line of output.split(/\r?\n/)) {
-    const [session, panePath] = line.split('\t');
-    if (!session || !panePath?.startsWith(prefix)) continue;
+    const [session, panePath = '', command = '', title = ''] = line.split('\t');
+    if (!session || !panePath.startsWith(prefix)) continue;
     const project = panePath.slice(prefix.length).split('/')[0];
     if (!project) continue;
     const archived = isTmuxSessionArchived(archive, root, project, session);
     if (!shouldShowForArchiveMode(archived, mode)) continue;
-    if (!sessionsByProject.has(project)) sessionsByProject.set(project, new Set());
-    sessionsByProject.get(project)?.add(session);
+    if (!sessionsByProject.has(project)) sessionsByProject.set(project, new Map());
+    const projectSessions = sessionsByProject.get(project)!;
+    const existing = projectSessions.get(session);
+    if (existing) {
+      existing.panes += 1;
+      if (!existing.cwd || existing.cwd.length > panePath.length) existing.cwd = panePath;
+      continue;
+    }
+    const sessionMeta = meta.get(session) ?? {};
+    projectSessions.set(session, {
+      name: session,
+      cwd: panePath,
+      command,
+      title,
+      created: sessionMeta.created ?? 0,
+      activity: sessionMeta.activity ?? 0,
+      windows: sessionMeta.windows ?? 0,
+      panes: 1,
+      attached: sessionMeta.attached ?? 0,
+      lastAttached: sessionMeta.lastAttached ?? 0,
+    });
   }
-  return new Map([...sessionsByProject.entries()].map(([project, sessions]) => [project, [...sessions].sort((a, b) => a.localeCompare(b))]));
+  return new Map([...sessionsByProject.entries()].map(([project, sessions]) => [project, [...sessions.values()].sort((a, b) => (b.activity - a.activity) || a.name.localeCompare(b.name))]));
 }
 
 function projectSessionCounts(root: string, mode: ArchiveMode = 'visible', archive = readArchiveStore()): Map<string, number> {
   return new Map([...projectSessionsByProject(root, mode, archive).entries()].map(([project, sessions]) => [project, sessions.length]));
+}
+
+function tmuxSessionAge(session: TmuxSession): string {
+  const timestamp = session.activity || session.created;
+  return timestamp > 0 ? savedSessionAge(timestamp * 1000) : '  ?';
+}
+
+function tmuxSessionLabel(session: TmuxSession, saved?: SavedSession, maxWidth = 112): string {
+  const width = Math.max(40, maxWidth);
+  const summary = saved?.title && saved.title !== '(untitled)' ? saved.title : session.title || session.command || session.name;
+  const prefix = `tmux  ${tmuxSessionAge(session).padStart(5)}  `;
+  const id = saved?.id ? saved.id.slice(0, 8) : '--------';
+  const suffixParts = [`${session.windows || 1}w/${session.panes || 1}p`, id];
+  if (session.attached > 0) suffixParts.push('attached');
+  const suffix = `  ${suffixParts.join(' ')}`;
+  const available = width - prefix.length - suffix.length - 2;
+  return fitLine(`${prefix}${clipEnd(summary, Math.max(8, available))}${suffix}`, width);
+}
+
+function tmuxSessionDetails(session: TmuxSession, saved?: SavedSession, maxWidth = 112): string[] {
+  const active = session.activity ? new Date(session.activity * 1000).toLocaleString() : 'unknown';
+  const created = session.created ? new Date(session.created * 1000).toLocaleString() : 'unknown';
+  const connected = session.lastAttached ? new Date(session.lastAttached * 1000).toLocaleString() : (session.attached ? 'currently attached' : 'unknown');
+  const summary = saved?.title && saved.title !== '(untitled)' ? saved.title : session.title || '(no summary available)';
+  return [
+    fitLine(`      summary: ${summary}`, maxWidth),
+    fitLine(`      pi session id: ${saved?.id ?? 'unknown'}  agent: ${saved?.agent ?? (session.command || 'unknown')}  command: ${session.command || 'unknown'}`, maxWidth),
+    fitLine(`      started: ${created}  last connected: ${connected}  last updated: ${active}`, maxWidth),
+    fitLine(`      windows: ${session.windows || 1}  panes: ${session.panes || 1}  attached clients: ${session.attached || 0}`, maxWidth),
+  ];
+}
+
+function savedSessionDetails(session: SavedSession, maxWidth = 112): string[] {
+  const cwdRaw = session.cwd.replace(os.homedir(), '~');
+  const modified = session.modified ? new Date(session.modified).toLocaleString() : 'unknown';
+  return [
+    fitLine(`      title: ${session.title || '(untitled)'}`, maxWidth),
+    fitLine(`      cwd: ${cwdRaw}`, maxWidth),
+    fitLine(`      id: ${session.id}  model: ${session.model || 'unknown'}  messages: ${session.messageCount}  modified: ${modified}`, maxWidth),
+  ];
 }
 
 function projectRecentTimes(root: string): Map<string, number> {
@@ -1117,7 +1244,7 @@ async function runSavedSessions(options: ServerOptions): Promise<void> {
   if (!sessions.length) fail(`no saved sessions found for agent filter '${savedSessionFilter(options)}'`);
   if (!process.stdin.isTTY) fail('interactive saved-session menu needs a TTY; pass --list for non-interactive use');
   const labels = sessions.map((session) => savedSessionLabel(session, menuLabelWidth()));
-  const choice = await arrowSelect(`Saved Pi/Codex sessions on ${os.hostname()} (↑/↓ or j/k, Enter)`, labels);
+  const choice = await arrowSelect(`${splashLine()} — Saved Pi/Codex sessions on ${os.hostname()} (↑/↓ or j/k, Enter)`, labels);
   if (choice === null) return;
   await attachSavedSession(sessions[choice], options);
 }
@@ -1237,7 +1364,7 @@ function isProjectFilterKey(key: string): boolean {
 }
 
 function projectTreePrompt(root: string, filter: string): string {
-  const base = `Projects on ${os.hostname()} in ${root}`;
+  const base = `${splashLine()} — Projects on ${os.hostname()} in ${root}`;
   return filter ? `${base} — filter: ${filter}` : base;
 }
 
@@ -1268,7 +1395,7 @@ function buildProjectTreeSnapshot(root: string, savedFilter = 'all', savedLimit 
   return { root, projects, archive };
 }
 
-function buildProjectTreeRowsFromSnapshot(snapshot: ProjectTreeSnapshot, expanded: string, filter = ''): MenuRow[] {
+function buildProjectTreeRowsFromSnapshot(snapshot: ProjectTreeSnapshot, expanded: string, filter = '', expandedItems = '|'): MenuRow[] {
   const rows: MenuRow[] = [];
   const savedLabelWidth = Math.max(36, menuLabelWidth() - 6);
   const filterNeedle = filter.trim().toLowerCase();
@@ -1287,13 +1414,27 @@ function buildProjectTreeRowsFromSnapshot(snapshot: ProjectTreeSnapshot, expande
         : `  ${project} (0)`,
     });
     if (isExpanded) {
-      for (const session of activeSessions) {
-        const archived = isTmuxSessionArchived(snapshot.archive, snapshot.root, project, session);
-        rows.push({ type: 'session', project, session, archived, label: `    ● ${archived ? '[archived] ' : ''}${session}` });
+      const activeSavedKeys = new Set<string>();
+      const savedForTmux = (tmux: TmuxSession): SavedSession | undefined => {
+        const match = savedSessions.find((saved) => savedTmuxSessionName(saved) === tmux.name);
+        if (match) activeSavedKeys.add(savedSessionArchiveKey(match));
+        return match;
+      };
+      for (const tmux of activeSessions) {
+        const saved = savedForTmux(tmux);
+        const archived = isTmuxSessionArchived(snapshot.archive, snapshot.root, project, tmux.name);
+        const itemKey = `${project}/tmux/${tmux.name}`;
+        const itemExpanded = expandedContains(expandedItems, itemKey);
+        rows.push({ type: 'session', project, session: tmux.name, tmux, saved, archived, expandable: true, expanded: itemExpanded, label: `    ${itemExpanded ? '▾' : '▸'} ● ${archived ? '[archived] ' : ''}${tmuxSessionLabel(tmux, saved, savedLabelWidth)}` });
+        if (itemExpanded) for (const detail of tmuxSessionDetails(tmux, saved, savedLabelWidth)) rows.push({ type: 'detail', project, session: tmux.name, label: detail });
       }
       for (const saved of savedSessions) {
+        if (activeSavedKeys.has(savedSessionArchiveKey(saved))) continue;
         const archived = Boolean(saved.archived);
-        rows.push({ type: 'saved', project, session: '', saved, archived, label: `    ◷ ${archived ? '[archived] ' : ''}${savedSessionLabel(saved, savedLabelWidth)}` });
+        const itemKey = `${project}/saved/${saved.agent}/${saved.id}`;
+        const itemExpanded = expandedContains(expandedItems, itemKey);
+        rows.push({ type: 'saved', project, session: '', saved, archived, expandable: true, expanded: itemExpanded, label: `    ${itemExpanded ? '▾' : '▸'} ◷ ${archived ? '[archived] ' : ''}${savedSessionLabel(saved, savedLabelWidth)}` });
+        if (itemExpanded) for (const detail of savedSessionDetails(saved, savedLabelWidth)) rows.push({ type: 'detail', project, session: '', label: detail });
       }
     }
   }
@@ -1307,7 +1448,9 @@ function buildProjectTreeRows(root: string, expanded: string, savedFilter = 'all
 }
 
 function projectTreeRowLabel(row: MenuRow, selected: boolean): string {
-  if (!selected || row.type !== 'project') return row.label;
+  if (!selected || (row.type !== 'project' && row.type !== 'session' && row.type !== 'saved')) return row.label;
+  if (row.type === 'session') return `${row.label}  ${row.expanded ? '← details' : '→ details'} · Enter=attach`;
+  if (row.type === 'saved') return `${row.label}  ${row.expanded ? '← details' : '→ details'} · Enter=resume`;
   if (row.expandable) {
     return `${row.label}  ${row.expanded ? '← collapse' : '→ expand'} · Enter=new`;
   }
@@ -1331,7 +1474,8 @@ function projectTreeFooter(selected: number, rows: MenuRow[], filter = ''): stri
   if (current.type === 'session' || current.type === 'saved') {
     const archiveHint = current.archived ? 'Ctrl+R restore' : 'Ctrl+A archive';
     const closeHint = current.type === 'session' ? 'Ctrl+X close' : 'Ctrl+X close/archive';
-    return `${position} ↑/↓ move  Enter resume  ${archiveHint}  ${closeHint}  ←/→ collapse project${hint}`;
+    const detailHint = '  ←/→ details';
+    return `${position} ↑/↓ move  Enter resume${detailHint}  ${archiveHint}  ${closeHint}${hint}`;
   }
   return `${position} ↑/↓ move  Enter select${hint}`;
 }
@@ -1361,6 +1505,7 @@ function askLine(prompt: string): Promise<string> {
 async function pickProjectMenu(root: string, options: ServerOptions): Promise<{ project: string; session: string; quit: boolean; saved?: SavedSession }> {
   if (!process.stdin.isTTY) fail('interactive project menu needs a TTY; pass --project NAME or --new NAME for non-interactive use');
   let expanded = '|';
+  let expandedItems = '|';
   let selected = 0;
   let offset = 0;
   let filter = '';
@@ -1368,7 +1513,7 @@ async function pickProjectMenu(root: string, options: ServerOptions): Promise<{ 
   const savedFilter = savedSessionFilter(options);
   const mode = archiveModeFromOptions(options);
   let snapshot = buildProjectTreeSnapshot(root, savedFilter, options.savedSessionLimit, mode);
-  let rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter);
+  let rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter, expandedItems);
   const visible = menuVisibleRows();
   const lines = visible + 2;
   const prompt = () => status ? `${projectTreePrompt(root, filter)} — ${status}` : projectTreePrompt(root, filter);
@@ -1380,13 +1525,13 @@ async function pickProjectMenu(root: string, options: ServerOptions): Promise<{ 
     if (offset < 0) offset = 0;
   };
   const rebuildRowsForFilter = () => {
-    rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter);
+    rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter, expandedItems);
     selected = 0;
     offset = 0;
   };
   const rebuildSnapshot = (preferredProject = '') => {
     snapshot = buildProjectTreeSnapshot(root, savedFilter, options.savedSessionLimit, mode);
-    rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter);
+    rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter, expandedItems);
     if (preferredProject) {
       const projectIndex = rows.findIndex((row) => row.type === 'project' && row.project === preferredProject);
       if (projectIndex >= 0) selected = projectIndex;
@@ -1428,9 +1573,21 @@ async function pickProjectMenu(root: string, options: ServerOptions): Promise<{ 
         }
       } else if (key === 'left' || key === 'right') {
         const current = rows[selected];
-        if (current && (current.type === 'project' || current.type === 'session' || current.type === 'saved') && current.project && (current.type !== 'project' || current.expandable)) {
+        if (current?.type === 'session' && current.project && current.session) {
+          const itemKey = `${current.project}/tmux/${current.session}`;
+          expandedItems = expandedContains(expandedItems, itemKey) ? expandedItems.replace(`|${itemKey}|`, '|') : `${expandedItems}${itemKey}|`;
+          rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter, expandedItems);
+          selected = Math.max(0, rows.findIndex((row) => row.type === 'session' && row.project === current.project && row.session === current.session));
+          redraw = true;
+        } else if (current?.type === 'saved' && current.project && current.saved) {
+          const itemKey = `${current.project}/saved/${current.saved.agent}/${current.saved.id}`;
+          expandedItems = expandedContains(expandedItems, itemKey) ? expandedItems.replace(`|${itemKey}|`, '|') : `${expandedItems}${itemKey}|`;
+          rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter, expandedItems);
+          selected = Math.max(0, rows.findIndex((row) => row.type === 'saved' && row.project === current.project && row.saved?.id === current.saved?.id));
+          redraw = true;
+        } else if (current && current.type === 'project' && current.project && current.expandable) {
           expanded = expandedContains(expanded, current.project) ? expanded.replace(`|${current.project}|`, '|') : `${expanded}${current.project}|`;
-          rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter);
+          rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter, expandedItems);
           selected = Math.max(0, rows.findIndex((row) => row.type === 'project' && row.project === current.project));
           redraw = true;
         }
@@ -1492,6 +1649,7 @@ async function pickProjectMenu(root: string, options: ServerOptions): Promise<{ 
         if (current.type === 'session') return { project: current.project, session: current.session, quit: false };
         if (current.type === 'saved' && current.saved) return { project: '', session: '', quit: false, saved: current.saved };
         if (current.type === 'quit') return { project: '', session: '', quit: true };
+        if (current.type === 'detail') { redraw = true; continue; }
         process.stdin.setRawMode(false);
         process.stdout.write('\x1b[?25h\n');
         const newName = await askLine('New project name: ');
@@ -1605,7 +1763,7 @@ async function runServer(args: string[]): Promise<void> {
     switch (arg) {
       case '--server': break;
       case '--help': case '-h': usage(); return;
-      case '--version': process.stdout.write(`${VERSION}\n`); return;
+      case '--version': process.stdout.write(`${packageVersion()}\n`); return;
       case '--project': options.projectName = args[++index] ?? fail('--project requires a name'); break;
       case '--new': options.newName = args[++index] ?? fail('--new requires a name'); break;
       case '--session': options.sessionName = args[++index] ?? fail('--session requires a name'); options.explicitSession = true; break;
@@ -1775,9 +1933,9 @@ function isGitCheckout(root: string): boolean {
 function readPackageVersion(root: string): string {
   try {
     const parsed = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')) as { version?: unknown };
-    return typeof parsed.version === 'string' && parsed.version ? parsed.version : VERSION;
+    return typeof parsed.version === 'string' && parsed.version ? parsed.version : packageVersion();
   } catch {
-    return VERSION;
+    return packageVersion();
   }
 }
 
@@ -1975,7 +2133,7 @@ function parseLocal(args: string[]): LocalOptions {
     const arg = args[index];
     switch (arg) {
       case '--help': case '-h': usage(); process.exit(0);
-      case '--version': process.stdout.write(`${VERSION}\n`); process.exit(0);
+      case '--version': process.stdout.write(`${packageVersion()}\n`); process.exit(0);
       case '--host': options.host = args[++index] ?? fail('--host requires a value'); break;
       case '--install-remote': options.install = true; break;
       case '--update': options.update = true; break;
@@ -2039,9 +2197,19 @@ async function runLocal(args: string[]): Promise<void> {
   const quotedHost = shellQuote(options.host);
   const remoteCommand = `remote_helper=${REMOTE_PROJECT_PATH}; if [[ ! -x $remote_helper ]]; then remote_helper=${REMOTE_LEGACY_PROJECT_PATH}; fi; if [[ ! -x $remote_helper ]]; then printf 'pi-remote is not installed on the remote host at %s or %s\\n' ${REMOTE_PROJECT_PATH} ${REMOTE_LEGACY_PROJECT_PATH} >&2; exit 127; fi; export PI_REMOTE_HOST=${quotedHost}; exec $remote_helper --server${quotedArgs}`;
   const sshArgs = ['-o', 'BatchMode=yes', options.needsTty ? '-tt' : '-T', options.host, 'bash', '-lc', shellQuote(remoteCommand)];
-  const result = run('ssh', sshArgs, { stdio: 'inherit' });
-  if (result.error) fail(`failed to run ssh: ${result.error.message}`);
-  process.exit(result.status ?? 1);
+
+  for (;;) {
+    const result = run('ssh', sshArgs, { stdio: 'inherit' });
+    restoreTerminal();
+    if (result.error) fail(`failed to run ssh: ${result.error.message}`);
+
+    const status = result.status ?? 1;
+    if (status !== 255 || !options.needsTty || !process.stdin.isTTY || !process.stdout.isTTY) process.exit(status);
+
+    process.stderr.write('pi-remote: SSH connection dropped; your remote tmux session should still be running.\n');
+    const reconnect = await askYesNo('Reconnect to the same pi-remote session?', true);
+    if (!reconnect) process.exit(status);
+  }
 }
 
 async function main(): Promise<void> {
