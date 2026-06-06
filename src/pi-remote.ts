@@ -1498,6 +1498,7 @@ function buildProjectTreeRows(root: string, expanded: string, savedFilter = 'all
 }
 
 function projectTreeRowLabel(row: MenuRow, selected: boolean): string {
+  if (selected && row.type === 'parent') return `${row.label}  Enter=open parent`;
   if (!selected || (row.type !== 'project' && row.type !== 'session' && row.type !== 'saved')) return row.label;
   if (row.type === 'session') return `${row.label}  ${row.expanded ? '← details' : '→ details'} · Enter=attach`;
   if (row.type === 'saved') return `${row.label}  ${row.expanded ? '← details' : '→ details'} · Enter=resume`;
@@ -1712,8 +1713,8 @@ async function pickProjectMenu(root: string, options: ServerOptions): Promise<{ 
         redraw = true;
       } else if (key === 'enter' || key === 'shift-enter') {
         const current = rows[selected];
-        if (key === 'shift-enter' && current.type === 'project') {
-          currentRoot = path.join(currentRoot, current.project);
+        if (current.type === 'parent') {
+          currentRoot = path.dirname(currentRoot);
           expanded = '|';
           expandedItems = '|';
           filter = '';
@@ -1724,8 +1725,8 @@ async function pickProjectMenu(root: string, options: ServerOptions): Promise<{ 
           redraw = true;
           continue;
         }
-        if (current.type === 'parent') {
-          currentRoot = path.dirname(currentRoot);
+        if (key === 'shift-enter' && current.type === 'project') {
+          currentRoot = path.join(currentRoot, current.project);
           expanded = '|';
           expandedItems = '|';
           filter = '';

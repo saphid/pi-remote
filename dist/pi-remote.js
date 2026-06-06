@@ -1478,6 +1478,8 @@ function buildProjectTreeRows(root, expanded, savedFilter = 'all', savedLimit = 
     return buildProjectTreeRowsFromSnapshot(buildProjectTreeSnapshot(root, savedFilter, savedLimit, mode), expanded, filter);
 }
 function projectTreeRowLabel(row, selected) {
+    if (selected && row.type === 'parent')
+        return `${row.label}  Enter=open parent`;
     if (!selected || (row.type !== 'project' && row.type !== 'session' && row.type !== 'saved'))
         return row.label;
     if (row.type === 'session')
@@ -1725,8 +1727,8 @@ async function pickProjectMenu(root, options) {
             }
             else if (key === 'enter' || key === 'shift-enter') {
                 const current = rows[selected];
-                if (key === 'shift-enter' && current.type === 'project') {
-                    currentRoot = path.join(currentRoot, current.project);
+                if (current.type === 'parent') {
+                    currentRoot = path.dirname(currentRoot);
                     expanded = '|';
                     expandedItems = '|';
                     filter = '';
@@ -1737,8 +1739,8 @@ async function pickProjectMenu(root, options) {
                     redraw = true;
                     continue;
                 }
-                if (current.type === 'parent') {
-                    currentRoot = path.dirname(currentRoot);
+                if (key === 'shift-enter' && current.type === 'project') {
+                    currentRoot = path.join(currentRoot, current.project);
                     expanded = '|';
                     expandedItems = '|';
                     filter = '';
