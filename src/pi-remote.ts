@@ -18,7 +18,7 @@ process.stdout.on('error', (error: any) => {
   throw error;
 });
 
-type MenuType = 'project' | 'session' | 'saved' | 'detail' | 'create' | 'quit';
+type MenuType = 'project' | 'session' | 'saved' | 'detail' | 'terminate' | 'create' | 'quit';
 type ArchiveMode = 'visible' | 'include' | 'archived';
 type MenuRow = {
   type: MenuType;
@@ -1472,7 +1472,10 @@ function buildProjectTreeRowsFromSnapshot(snapshot: ProjectTreeSnapshot, expande
         const itemKey = `${project}/tmux/${tmux.name}`;
         const itemExpanded = expandedContains(expandedItems, itemKey);
         rows.push({ type: 'session', project, session: tmux.name, tmux, saved, archived, expandable: true, expanded: itemExpanded, label: `    ${itemExpanded ? '▾' : '▸'} ● ${archived ? '[archived] ' : ''}${tmuxSessionLabel(tmux, saved, savedLabelWidth)}` });
-        if (itemExpanded) for (const detail of tmuxSessionDetails(tmux, saved, savedLabelWidth)) rows.push({ type: 'detail', project, session: tmux.name, label: detail });
+        if (itemExpanded) {
+          for (const detail of tmuxSessionDetails(tmux, saved, savedLabelWidth)) rows.push({ type: 'detail', project, session: tmux.name, label: detail });
+          rows.push({ type: 'terminate', project, session: tmux.name, label: '      Terminate tmux session' });
+        }
       }
       for (const saved of savedSessions) {
         if (activeSavedKeys.has(savedSessionArchiveKey(saved))) continue;
@@ -1519,10 +1522,11 @@ function projectTreeFooter(selected: number, rows: MenuRow[], filter = ''): stri
   }
   if (current.type === 'session' || current.type === 'saved') {
     const archiveHint = current.archived ? 'Ctrl+R restore' : 'Ctrl+A archive';
-    const closeHint = current.type === 'session' ? 'Ctrl+T terminate' : 'Ctrl+X close/archive';
+    const closeHint = current.type === 'session' ? 'terminate in details' : 'Ctrl+X close/archive';
     const detailHint = '  ←/→ details';
     return `${position} ↑/↓ move  Enter resume${detailHint}  ${archiveHint}  ${closeHint}${hint}`;
   }
+  if (current.type === 'terminate') return `${position} ↑/↓ move  Enter terminate tmux session${hint}`;
   return `${position} ↑/↓ move  Enter select${hint}`;
 }
 
@@ -1665,7 +1669,7 @@ async function pickProjectMenu(root: string, options: ServerOptions): Promise<{ 
         }
       } else if (key === 'ctrl-x' || key === 'ctrl-t') {
         const current = rows[selected];
-        if (current?.type === 'session') {
+        if (current?.type === 'session' || current?.type === 'terminate') {
           clearBeforeRedraw = true;
           if (await confirmAction(`Terminate tmux session '${current.session}'? This kills the live process but leaves agent history files alone.`)) {
             const closed = closeTmuxSession(current.session);
@@ -1695,6 +1699,17 @@ async function pickProjectMenu(root: string, options: ServerOptions): Promise<{ 
         if (current.type === 'session') return { project: current.project, session: current.session, quit: false };
         if (current.type === 'saved' && current.saved) return { project: '', session: '', quit: false, saved: current.saved };
         if (current.type === 'quit') return { project: '', session: '', quit: true };
+        if (current.type === 'terminate') {
+          clearBeforeRedraw = true;
+          if (await confirmAction(`Terminate tmux session '${current.session}'? This kills the live process but leaves agent history files alone.`)) {
+            const closed = closeTmuxSession(current.session);
+            if (closed) unarchiveTmuxSession(root, current.project, current.session);
+            status = closed ? `terminated ${current.session}` : `could not terminate ${current.session}`;
+            rebuildSnapshot(current.project);
+          }
+          redraw = true;
+          continue;
+        }
         if (current.type === 'detail') { redraw = true; continue; }
         process.stdin.setRawMode(false);
         process.stdout.write('\x1b[?25h\n');
