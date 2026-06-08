@@ -222,18 +222,56 @@ function runOk(command, args, options = {}) {
 }
 function restoreTerminal() {
     // If ssh/tmux disappears while an agent TUI is in raw/alternate-screen mode,
-    // the local terminal can be left with hidden cursor, no echo, or broken line
-    // discipline. Best-effort reset before printing pi-remote prompts/errors.
-    if (!process.stdin.isTTY && !process.stdout.isTTY)
+    // the local terminal can be left with hidden cursor, no echo, mouse reporting,
+    // bracketed paste, or broken line discipline. Best-effort reset before printing
+    // pi-remote prompts/errors. Use /dev/tty explicitly: spawnSync's default piped
+    // stdin is not the controlling terminal, so plain `stty sane` can be a no-op.
+    if (!process.stdin.isTTY && !process.stdout.isTTY && !fs.existsSync('/dev/tty'))
         return;
     try {
-        run('stty', ['sane'], { stdio: 'ignore' });
+        run('bash', ['-lc', 'stty sane </dev/tty'], { stdio: 'ignore' });
     }
     catch { }
+    const resetSequences = [
+        '\x1b[?1049l', // leave alternate screen
+        '\x1b[?47l',
+        '\x1b[?25h', // show cursor
+        '\x1b[?1l', // normal cursor keys
+        '\x1b[?7h', // wraparound on
+        '\x1b[?12l', // stop cursor blink mode
+        '\x1b[?1000l', // mouse modes off
+        '\x1b[?1002l',
+        '\x1b[?1003l',
+        '\x1b[?1004l', // focus events off
+        '\x1b[?1005l',
+        '\x1b[?1006l',
+        '\x1b[?1015l',
+        '\x1b[?2004l', // bracketed paste off
+        '\x1b[0m', // attributes reset
+        '\r\n',
+    ].join('');
     try {
-        process.stdout.write('\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[0m\x1b[?1049l\r\n');
+        fs.writeFileSync('/dev/tty', resetSequences);
     }
-    catch { }
+    catch {
+        try {
+            process.stdout.write(resetSequences);
+        }
+        catch { }
+    }
+}
+let terminalCleanupInstalled = false;
+function installTerminalCleanup() {
+    if (terminalCleanupInstalled)
+        return;
+    terminalCleanupInstalled = true;
+    process.once('exit', () => restoreTerminal());
+    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+        process.once(signal, () => {
+            restoreTerminal();
+            process.exit(signal === 'SIGINT' ? 130 : 129);
+        });
+    }
 }
 function askYesNo(prompt, defaultYes = true) {
     return new Promise((resolve) => {
@@ -1477,7 +1515,9 @@ function buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter = '', expan
 function buildProjectTreeRows(root, expanded, savedFilter = 'all', savedLimit = 120, filter = '', mode = 'visible') {
     return buildProjectTreeRowsFromSnapshot(buildProjectTreeSnapshot(root, savedFilter, savedLimit, mode), expanded, filter);
 }
-function projectTreeRowLabel(row, selected) {
+function projectTreeRowLabel(row, selected, confirmTerminateSession = '') {
+    if (selected && row.type === 'terminate' && confirmTerminateSession === row.session)
+        return `${row.label}  Really terminate? y/N`;
     if (selected && row.type === 'parent')
         return `${row.label}  Enter=open parent`;
     if (!selected || (row.type !== 'project' && row.type !== 'session' && row.type !== 'saved'))
@@ -1517,7 +1557,7 @@ function projectTreeFooter(selected, rows, filter = '') {
         return `${position} ↑/↓ move  Enter terminate tmux session${hint}`;
     return `${position} ↑/↓ move  Enter select${hint}`;
 }
-function renderProjectTreeMenu(prompt, selected, offset, visible, rows, filter = '') {
+function renderProjectTreeMenu(prompt, selected, offset, visible, rows, filter = '', confirmTerminateSession = '') {
     const columns = terminalColumns();
     const lineWidth = Math.max(1, columns - 1);
     const labelWidth = Math.max(1, columns - 3);
@@ -1526,7 +1566,7 @@ function renderProjectTreeMenu(prompt, selected, offset, visible, rows, filter =
         const index = offset + row;
         if (index < rows.length) {
             const rowItem = rows[index];
-            const label = fitLine(projectTreeRowLabel(rowItem, index === selected), labelWidth);
+            const label = fitLine(projectTreeRowLabel(rowItem, index === selected, confirmTerminateSession), labelWidth);
             if (index === selected && rowItem.type === 'terminate')
                 process.stdout.write(`\x1b[K\x1b[41;97;1m! ${label}\x1b[0m\n`);
             else
@@ -1552,6 +1592,7 @@ async function pickProjectMenu(root, options) {
     let offset = 0;
     let filter = '';
     let status = '';
+    let confirmTerminateSession = '';
     const savedFilter = savedSessionFilter(options);
     const mode = archiveModeFromOptions(options);
     let snapshot = buildProjectTreeSnapshot(currentRoot, savedFilter, options.savedSessionLimit, mode);
@@ -1621,7 +1662,7 @@ async function pickProjectMenu(root, options) {
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdout.write('\x1b[?25l');
-    renderProjectTreeMenu(prompt(), selected, offset, visible, rows, filter);
+    renderProjectTreeMenu(prompt(), selected, offset, visible, rows, filter, confirmTerminateSession);
     try {
         for (;;) {
             const key = await readKey();
@@ -1629,6 +1670,31 @@ async function pickProjectMenu(root, options) {
             let clearBeforeRedraw = false;
             if (key === 'ctrl-c')
                 process.exit(130);
+            if (confirmTerminateSession) {
+                const current = rows[selected];
+                if (key === 'y' || key === 'Y') {
+                    if (current?.type === 'terminate' && current.session === confirmTerminateSession) {
+                        const closed = closeTmuxSession(current.session);
+                        if (closed)
+                            unarchiveTmuxSession(currentRoot, current.project, current.session);
+                        status = closed ? `terminated ${current.session}` : `could not terminate ${current.session}`;
+                        rebuildSnapshot(current.project);
+                    }
+                    confirmTerminateSession = '';
+                    redraw = true;
+                }
+                else if (key === 'n' || key === 'N' || key === 'escape' || key === 'enter' || key === 'ctrl-x' || key === 'ctrl-t') {
+                    confirmTerminateSession = '';
+                    redraw = true;
+                }
+                if (redraw) {
+                    clampSelection();
+                    process.stdout.write(`\x1b[${lines}A`);
+                    renderProjectTreeMenu(prompt(), selected, offset, visible, rows, filter, confirmTerminateSession);
+                    status = '';
+                    continue;
+                }
+            }
             if (key === 'up') {
                 selected -= 1;
                 redraw = true;
@@ -1740,14 +1806,16 @@ async function pickProjectMenu(root, options) {
             else if (key === 'ctrl-x' || key === 'ctrl-t') {
                 const current = rows[selected];
                 if (current?.type === 'session' || current?.type === 'terminate') {
-                    clearBeforeRedraw = true;
-                    if (await confirmAction(`Terminate tmux session '${current.session}'? This kills the live process but leaves agent history files alone.`)) {
-                        const closed = closeTmuxSession(current.session);
-                        if (closed)
-                            unarchiveTmuxSession(currentRoot, current.project, current.session);
-                        status = closed ? `terminated ${current.session}` : `could not terminate ${current.session}`;
-                        rebuildSnapshot(current.project);
+                    if (current.type === 'session') {
+                        const itemKey = `${current.project}/tmux/${current.session}`;
+                        if (!expandedContains(expandedItems, itemKey))
+                            expandedItems = `${expandedItems}${itemKey}|`;
+                        rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter, expandedItems);
+                        const terminateIndex = rows.findIndex((row) => row.type === 'terminate' && row.project === current.project && row.session === current.session);
+                        if (terminateIndex >= 0)
+                            selected = terminateIndex;
                     }
+                    confirmTerminateSession = current.session;
                     redraw = true;
                 }
                 else if (key === 'ctrl-x' && current?.type === 'saved' && current.saved) {
@@ -1786,36 +1854,26 @@ async function pickProjectMenu(root, options) {
                 if (current.type === 'parent') {
                     navigateToRoot(path.dirname(currentRoot));
                     redraw = true;
-                    continue;
                 }
-                if (current.type === 'project') {
+                else if (current.type === 'project') {
                     navigateToRoot(path.join(currentRoot, current.project));
                     redraw = true;
-                    continue;
                 }
-                if (current.type === 'session')
+                else if (current.type === 'session')
                     return { root: currentRoot, project: current.project, session: current.session, quit: false };
-                if (current.type === 'saved' && current.saved)
+                else if (current.type === 'saved' && current.saved)
                     return { root: currentRoot, project: '', session: '', quit: false, saved: current.saved };
-                if (current.type === 'quit')
+                else if (current.type === 'quit')
                     return { root: currentRoot, project: '', session: '', quit: true };
-                if (current.type === 'terminate') {
-                    clearBeforeRedraw = true;
-                    if (await confirmAction(`Terminate tmux session '${current.session}'? This kills the live process but leaves agent history files alone.`)) {
-                        const closed = closeTmuxSession(current.session);
-                        if (closed)
-                            unarchiveTmuxSession(currentRoot, current.project, current.session);
-                        status = closed ? `terminated ${current.session}` : `could not terminate ${current.session}`;
-                        rebuildSnapshot(current.project);
-                    }
+                else if (current.type === 'terminate') {
+                    confirmTerminateSession = current.session;
                     redraw = true;
-                    continue;
                 }
-                if (current.type === 'detail') {
+                else if (current.type === 'detail') {
                     redraw = true;
-                    continue;
                 }
-                return await createProject();
+                else
+                    return await createProject();
             }
             if (redraw) {
                 clampSelection();
@@ -1823,7 +1881,7 @@ async function pickProjectMenu(root, options) {
                     process.stdout.write('\x1b[2J\x1b[H');
                 else
                     process.stdout.write(`\x1b[${lines}A`);
-                renderProjectTreeMenu(prompt(), selected, offset, visible, rows, filter);
+                renderProjectTreeMenu(prompt(), selected, offset, visible, rows, filter, confirmTerminateSession);
                 status = '';
             }
         }
@@ -2038,6 +2096,11 @@ async function runServer(args) {
                     options.agentArgs.push(arg);
         }
     }
+    const unexpected = !options.projectName && !options.newName && !options.sessionsProject && !options.savedSessions && !options.doList && !options.configureTmux && options.agentArgs.length
+        ? options.agentArgs[0]
+        : '';
+    if (unexpected)
+        failUnexpectedPositional(unexpected);
     options.projectRoot = expandHomePath(options.projectRoot);
     process.env.PATH = `${os.homedir()}/.local/npm-global/bin:${os.homedir()}/.npm-global/bin:${os.homedir()}/.local/bin:${process.env.PATH ?? ''}`;
     if (options.savedSessions) {
@@ -2348,6 +2411,24 @@ function writeLocalConfig(host) {
     fs.writeFileSync(file, `host=${host}\nproject_root=~/projects\nagent=pi\npi_command=pi\nclaude_command=claude\ncodex_command=codex\n`);
     process.stdout.write(`wrote config: ${file}\n`);
 }
+function firstUnexpectedPositional(args) {
+    for (let index = 0; index < args.length; index += 1) {
+        const arg = args[index];
+        if (arg === '--')
+            return '';
+        if (!arg.startsWith('-'))
+            return arg;
+        if (['--host', '--project', '--new', '--sessions', '--saved-agent', '--saved-session-limit', '--session', '--agent', '--command', '--project-root', '--pi-bin'].includes(arg))
+            index += 1;
+    }
+    return '';
+}
+function failUnexpectedPositional(arg) {
+    const hint = fs.existsSync(arg)
+        ? 'looks like a file path; pi-remote expects a project name via --project/--new, and agent prompts/files must come after -- with --project or --new'
+        : 'use --project NAME, --new NAME, or put agent arguments after -- with --project or --new';
+    fail(`unexpected argument: ${arg}\n${hint}`);
+}
 function parseLocal(args) {
     const configHost = configGet('host', '');
     const options = {
@@ -2478,6 +2559,11 @@ function isLocalHost(host) {
 }
 async function runLocal(args) {
     const options = parseLocal(args);
+    const unexpected = !options.hasProject && !options.hasNew && !options.doSessions && !options.doSavedSessions && !options.doList && !options.configureTmux
+        ? firstUnexpectedPositional(options.serverArgs)
+        : '';
+    if (unexpected)
+        failUnexpectedPositional(unexpected);
     if (options.initConfig) {
         writeLocalConfig(options.host);
         return;
@@ -2501,9 +2587,15 @@ async function runLocal(args) {
     const quotedHost = shellQuote(options.host);
     const remoteCommand = `remote_helper=${REMOTE_PROJECT_PATH}; if [[ ! -x $remote_helper ]]; then remote_helper=${REMOTE_LEGACY_PROJECT_PATH}; fi; if [[ ! -x $remote_helper ]]; then printf 'pi-remote is not installed on the remote host at %s or %s\\n' ${REMOTE_PROJECT_PATH} ${REMOTE_LEGACY_PROJECT_PATH} >&2; exit 127; fi; export PI_REMOTE_HOST=${quotedHost}; exec $remote_helper --server${quotedArgs}`;
     const sshArgs = ['-o', 'BatchMode=yes', options.needsTty ? '-tt' : '-T', options.host, 'bash', '-lc', shellQuote(remoteCommand)];
+    installTerminalCleanup();
     for (;;) {
-        const result = run('ssh', sshArgs, { stdio: 'inherit' });
-        restoreTerminal();
+        let result;
+        try {
+            result = run('ssh', sshArgs, { stdio: 'inherit' });
+        }
+        finally {
+            restoreTerminal();
+        }
         if (result.error)
             fail(`failed to run ssh: ${result.error.message}`);
         const status = result.status ?? 1;
