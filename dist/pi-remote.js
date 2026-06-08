@@ -91,7 +91,7 @@ Usage:
   pi-remote --init-config --host HOST       Create a local config file, then exit
   pi-remote --list
 
-Interactive project menus use ↑/↓ to move, type to filter by project name, Backspace/Ctrl+U to edit the filter, → to expand, ← to collapse, Shift+Enter to open a folder, Enter to select/start, Ctrl+A to archive the selected session, Ctrl+X to close it, and Ctrl+R to restore archived rows when shown with --include-archived. Saved-session pickers also support j/k.
+Interactive project menus use ↑/↓ to move, type to filter by project name, Enter to open a folder, Backspace to delete filter text or go to the parent folder, → to expand/open, ← to collapse/go parent, s to start a new session for the selected folder, n to create a new folder, q to quit, Ctrl+A to archive the selected session, Ctrl+X to close it, and Ctrl+R to restore archived rows when shown with --include-archived. Saved-session pickers also support j/k.
 
 Options:
   --host HOST             SSH host to use (default: config host, PI_REMOTE_HOST, or pi-remote)
@@ -1487,9 +1487,9 @@ function projectTreeRowLabel(row, selected) {
     if (row.type === 'saved')
         return `${row.label}  ${row.expanded ? '← details' : '→ details'} · Enter=resume`;
     if (row.expandable) {
-        return `${row.label}  ${row.expanded ? '← collapse' : '→ expand'} · Enter=new`;
+        return `${row.label}  ${row.expanded ? '← collapse' : '→ expand'} · Enter=open · s=new session`;
     }
-    return `${row.label}  Enter=new`;
+    return `${row.label}  Enter=open · s=new session`;
 }
 function projectTreeFilterHint(filter) {
     return filter ? `  filter: ${filter}  Backspace edit Ctrl+U clear` : '  type to filter';
@@ -1501,11 +1501,11 @@ function projectTreeFooter(selected, rows, filter = '') {
     if (!current)
         return `${position} ↑/↓ move  Enter select${hint}`;
     if (current.type === 'parent')
-        return `${position} ↑/↓ move  Enter parent directory${hint}`;
+        return `${position} ↑/↓ move  Enter parent  Backspace parent${hint}`;
     if (current.type === 'project') {
         return current.expandable
-            ? `${position} ↑/↓ move  → expand  ← collapse  Enter new session  Shift+Enter open folder${hint}`
-            : `${position} ↑/↓ move  Enter new session  Shift+Enter open folder${hint}`;
+            ? `${position} ↑/↓ move  Enter open  → expand/open  ← collapse/parent  s new session  n new folder  q quit${hint}`
+            : `${position} ↑/↓ move  Enter open  s new session  n new folder  q quit${hint}`;
     }
     if (current.type === 'session' || current.type === 'saved') {
         const archiveHint = current.archived ? 'Ctrl+R restore' : 'Ctrl+A archive';
@@ -1599,6 +1599,25 @@ async function pickProjectMenu(root, options) {
         process.stdout.write('\x1b[?25l');
         return /^(y|yes)$/i.test(answer.trim());
     };
+    const navigateToRoot = (nextRoot) => {
+        currentRoot = nextRoot;
+        expanded = '|';
+        expandedItems = '|';
+        filter = '';
+        status = `root ${currentRoot}`;
+        rebuildSnapshot();
+        selected = rows.length > 1 ? 1 : 0;
+        offset = 0;
+    };
+    const createProject = async () => {
+        if (process.stdin.isRaw)
+            process.stdin.setRawMode(false);
+        process.stdout.write('\x1b[?25h\n');
+        const newName = await askLine('New project name: ');
+        const safeName = sanitizeName(newName);
+        fs.mkdirSync(path.join(currentRoot, safeName), { recursive: true });
+        return { root: currentRoot, project: safeName, session: '', quit: false };
+    };
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdout.write('\x1b[?25l');
@@ -1622,8 +1641,11 @@ async function pickProjectMenu(root, options) {
                 if (filter) {
                     filter = removeLastInputCharacter(filter);
                     rebuildRowsForFilter();
-                    redraw = true;
                 }
+                else {
+                    navigateToRoot(path.dirname(currentRoot));
+                }
+                redraw = true;
             }
             else if (key === 'ctrl-u' || key === 'escape') {
                 if (filter) {
@@ -1655,14 +1677,34 @@ async function pickProjectMenu(root, options) {
                         redraw = true;
                     }
                 }
-                else if (current && current.type === 'project' && current.project && current.expandable) {
+                else if (current && current.type === 'project' && current.project) {
                     const isExpanded = expandedContains(expanded, current.project);
-                    if (shouldExpand !== isExpanded) {
-                        expanded = shouldExpand ? `${expanded}${current.project}|` : expanded.replace(`|${current.project}|`, '|');
-                        rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter, expandedItems);
-                        selected = Math.max(0, rows.findIndex((row) => row.type === 'project' && row.project === current.project));
+                    if (shouldExpand) {
+                        if (current.expandable && !isExpanded) {
+                            expanded = `${expanded}${current.project}|`;
+                            rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter, expandedItems);
+                            selected = Math.max(0, rows.findIndex((row) => row.type === 'project' && row.project === current.project));
+                        }
+                        else {
+                            navigateToRoot(path.join(currentRoot, current.project));
+                        }
                         redraw = true;
                     }
+                    else {
+                        if (current.expandable && isExpanded) {
+                            expanded = expanded.replace(`|${current.project}|`, '|');
+                            rows = buildProjectTreeRowsFromSnapshot(snapshot, expanded, filter, expandedItems);
+                            selected = Math.max(0, rows.findIndex((row) => row.type === 'project' && row.project === current.project));
+                        }
+                        else {
+                            navigateToRoot(path.dirname(currentRoot));
+                        }
+                        redraw = true;
+                    }
+                }
+                else if (key === 'left') {
+                    navigateToRoot(path.dirname(currentRoot));
+                    redraw = true;
                 }
             }
             else if (key === 'ctrl-a') {
@@ -1720,6 +1762,20 @@ async function pickProjectMenu(root, options) {
                     redraw = true;
                 }
             }
+            else if (!filter && (key === 'q' || key === 'Q')) {
+                return { root: currentRoot, project: '', session: '', quit: true };
+            }
+            else if (!filter && (key === 's' || key === 'S')) {
+                const current = rows[selected];
+                if (current?.type === 'project')
+                    return { root: currentRoot, project: current.project, session: '', quit: false };
+                filter += key;
+                rebuildRowsForFilter();
+                redraw = true;
+            }
+            else if (!filter && (key === 'n' || key === 'N')) {
+                return await createProject();
+            }
             else if (isProjectFilterKey(key)) {
                 filter += key;
                 rebuildRowsForFilter();
@@ -1728,31 +1784,15 @@ async function pickProjectMenu(root, options) {
             else if (key === 'enter' || key === 'shift-enter') {
                 const current = rows[selected];
                 if (current.type === 'parent') {
-                    currentRoot = path.dirname(currentRoot);
-                    expanded = '|';
-                    expandedItems = '|';
-                    filter = '';
-                    status = `root ${currentRoot}`;
-                    rebuildSnapshot();
-                    selected = rows.length > 1 ? 1 : 0;
-                    offset = 0;
+                    navigateToRoot(path.dirname(currentRoot));
                     redraw = true;
                     continue;
                 }
-                if (key === 'shift-enter' && current.type === 'project') {
-                    currentRoot = path.join(currentRoot, current.project);
-                    expanded = '|';
-                    expandedItems = '|';
-                    filter = '';
-                    status = `root ${currentRoot}`;
-                    rebuildSnapshot();
-                    selected = rows.length > 1 ? 1 : 0;
-                    offset = 0;
+                if (current.type === 'project') {
+                    navigateToRoot(path.join(currentRoot, current.project));
                     redraw = true;
                     continue;
                 }
-                if (current.type === 'project')
-                    return { root: currentRoot, project: current.project, session: '', quit: false };
                 if (current.type === 'session')
                     return { root: currentRoot, project: current.project, session: current.session, quit: false };
                 if (current.type === 'saved' && current.saved)
@@ -1775,12 +1815,7 @@ async function pickProjectMenu(root, options) {
                     redraw = true;
                     continue;
                 }
-                process.stdin.setRawMode(false);
-                process.stdout.write('\x1b[?25h\n');
-                const newName = await askLine('New project name: ');
-                const safeName = sanitizeName(newName);
-                fs.mkdirSync(path.join(currentRoot, safeName), { recursive: true });
-                return { root: currentRoot, project: safeName, session: '', quit: false };
+                return await createProject();
             }
             if (redraw) {
                 clampSelection();
