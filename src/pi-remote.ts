@@ -95,6 +95,7 @@ type ServerOptions = {
   agent: string;
   explicitAgent: boolean;
   explicitCommand: string;
+  agentSwitches: string[];
   agentArgs: string[];
 };
 
@@ -146,6 +147,7 @@ Usage:
   pi-remote --project NAME                 Start/attach for an existing ~/projects/NAME
   pi-remote --new NAME                     Create ~/projects/NAME, then start/attach
   pi-remote --agent pi|claude|codex        Choose the remote agent command (default: pi)
+  claude-remote                            Alias for pi-remote --agent claude with Claude's dangerous skip-permissions switch
   pi-remote --project NAME --no-attach [-- AGENT_ARGS...]
   pi-remote --configure-tmux              Check/update remote tmux defaults, then exit
   pi-remote --update                       Pull/update this pi-remote install from GitHub, then exit
@@ -165,6 +167,7 @@ Options:
   --session NAME          tmux session name (default: pi-remote-<project>)
   --agent NAME            Remote agent: pi, claude, codex, or custom (default from config/env: pi)
   --command COMMAND       Custom remote launch command; overrides --agent command lookup
+  --agent-switch SWITCH   Add a default switch/arg before args passed after -- (repeatable)
   --no-attach             Create the tmux session detached and print the attach command
   --configure-tmux       Ask to install/update pi-remote tmux defaults and exit
   --install-remote       Install/update the remote helper copy and exit
@@ -194,6 +197,10 @@ Config:
     pi_command=pi
     claude_command=claude
     codex_command=codex
+    agent_args=
+    pi_args=
+    claude_args=
+    codex_args=
     launch_command=pi
 
 Environment:
@@ -202,6 +209,10 @@ Environment:
   PI_REMOTE_PROJECT_ROOT  Default remote project root for server mode.
   PI_REMOTE_AGENT         Default agent for server mode.
   PI_REMOTE_LAUNCH_COMMAND Custom launch command for server mode.
+  PI_REMOTE_AGENT_ARGS    Default switches/args passed to every agent.
+  PI_REMOTE_PI_ARGS       Default switches/args passed to Pi.
+  PI_REMOTE_CLAUDE_ARGS   Default switches/args passed to Claude.
+  PI_REMOTE_CODEX_ARGS    Default switches/args passed to Codex.
   PI_REMOTE_PI_BIN        Default Pi executable for server mode.
   PI_REMOTE_CLAUDE_BIN    Default Claude executable for server mode.
   PI_REMOTE_CODEX_BIN     Default Codex executable for server mode.
@@ -271,6 +282,78 @@ function shellQuote(value = ''): string {
 
 function shellJoin(args: string[]): string {
   return args.map((arg) => shellQuote(arg)).join(' ');
+}
+
+function parseShellWords(value: string, source: string): string[] {
+  const words: string[] = [];
+  let current = '';
+  let quote: "'" | '"' | '' = '';
+  let escaping = false;
+  let sawToken = false;
+
+  const push = () => {
+    if (!sawToken) return;
+    words.push(current);
+    current = '';
+    sawToken = false;
+  };
+
+  for (const char of Array.from(value)) {
+    if (escaping) {
+      current += char;
+      sawToken = true;
+      escaping = false;
+      continue;
+    }
+    if (quote === "'") {
+      if (char === "'") quote = '';
+      else current += char;
+      sawToken = true;
+      continue;
+    }
+    if (quote === '"') {
+      if (char === '"') quote = '';
+      else if (char === '\\') escaping = true;
+      else current += char;
+      sawToken = true;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      push();
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      sawToken = true;
+      continue;
+    }
+    if (char === '\\') {
+      escaping = true;
+      sawToken = true;
+      continue;
+    }
+    current += char;
+    sawToken = true;
+  }
+  if (escaping) current += '\\';
+  if (quote) fail(`unterminated quote in ${source}`);
+  push();
+  return words;
+}
+
+function configArgs(key: string, envName: string): string[] {
+  const raw = env(envName) ?? configGet(key, '');
+  return raw ? parseShellWords(raw, `${envName}/${key}`) : [];
+}
+
+function configuredAgentArgs(agent: string): string[] {
+  const upper = agent.toUpperCase().replace(/[^A-Z0-9]+/g, '_');
+  return [
+    ...configArgs('agent_args', 'PI_REMOTE_AGENT_ARGS'),
+    ...configArgs('agent_switches', 'PI_REMOTE_AGENT_SWITCHES'),
+    ...configArgs(`${agent}_args`, `PI_REMOTE_${upper}_ARGS`),
+    ...configArgs(`${agent}_switches`, `PI_REMOTE_${upper}_SWITCHES`),
+  ];
 }
 
 function run(command: string, args: string[], options: { cwd?: string; input?: string; stdio?: 'inherit' | 'ignore' } = {}) {
@@ -1935,6 +2018,7 @@ async function runServer(args: string[]): Promise<void> {
     agent: env('PI_REMOTE_AGENT') ?? (configuredAgent || 'pi'),
     explicitAgent: false,
     explicitCommand: '',
+    agentSwitches: [],
     agentArgs: [],
   };
 
@@ -1954,6 +2038,7 @@ async function runServer(args: string[]): Promise<void> {
       case '--include-archived': options.includeArchived = true; break;
       case '--archived': options.archivedOnly = true; options.includeArchived = true; break;
       case '--command': options.explicitCommand = args[++index] ?? fail('--command requires a shell command'); break;
+      case '--agent-switch': case '--agent-arg': options.agentSwitches.push(args[++index] ?? fail(`${arg} requires a value`)); break;
       case '--project-root': options.projectRoot = args[++index] ?? fail('--project-root requires a path'); break;
       case '--pi-bin': options.explicitCommand = args[++index] ?? fail('--pi-bin requires a path'); options.agent = 'pi'; options.explicitAgent = true; break;
       case '--no-attach': options.noAttach = true; break;
@@ -1973,6 +2058,8 @@ async function runServer(args: string[]): Promise<void> {
         else if (arg === '--include-archived') options.includeArchived = true;
         else if (arg === '--archived') { options.archivedOnly = true; options.includeArchived = true; }
         else if (arg.startsWith('--command=')) options.explicitCommand = arg.slice('--command='.length);
+        else if (arg.startsWith('--agent-switch=')) options.agentSwitches.push(arg.slice('--agent-switch='.length));
+        else if (arg.startsWith('--agent-arg=')) options.agentSwitches.push(arg.slice('--agent-arg='.length));
         else if (arg.startsWith('--project-root=')) options.projectRoot = arg.slice('--project-root='.length);
         else if (arg.startsWith('--pi-bin=')) { options.explicitCommand = arg.slice('--pi-bin='.length); options.agent = 'pi'; options.explicitAgent = true; }
         else if (arg.startsWith('--sessions=')) options.sessionsProject = arg.slice('--sessions='.length);
@@ -2058,7 +2145,8 @@ async function runServer(args: string[]): Promise<void> {
 
   const launchBase = resolveAgentCommand(options.agent, options.explicitCommand);
   checkLaunchCommandExists(launchBase);
-  const agentCommand = options.agentArgs.length ? `${launchBase} ${shellJoin(options.agentArgs)}` : launchBase;
+  const launchArgs = [...configuredAgentArgs(options.agent), ...options.agentSwitches, ...options.agentArgs];
+  const agentCommand = launchArgs.length ? `${launchBase} ${shellJoin(launchArgs)}` : launchBase;
 
   if (!options.explicitSession && !options.noAttach && !options.dryRun) options.sessionName = uniqueSessionName(options.sessionName);
 
@@ -2271,10 +2359,11 @@ install -m 0755 "$HOME/pi-remote.js.tmp" "$HOME/${targetDir}/dist/pi-remote.js"
 install -m 0755 "$HOME/pi-remote.wrapper.tmp" "$HOME/${targetDir}/pi-remote"
 install -m 0755 "$HOME/pi-remote.sh.tmp" "$HOME/${targetDir}/pi-remote.sh"
 ln -sf "$HOME/${targetDir}/pi-remote" "$HOME/.local/bin/pi-remote"
+ln -sf "$HOME/${targetDir}/pi-remote" "$HOME/.local/bin/claude-remote"
 ln -sf "$HOME/${targetDir}/pi-remote.sh" "$HOME/.local/bin/pi-remote.sh"
 rm -f "$HOME/pi-remote.js.tmp" "$HOME/pi-remote.wrapper.tmp" "$HOME/pi-remote.sh.tmp"
 if [ ! -f "$HOME/.config/pi-remote/config" ]; then
-  printf '%s\n' 'project_root=~/projects' 'agent=pi' 'pi_command=pi' 'claude_command=claude' 'codex_command=codex' > "$HOME/.config/pi-remote/config"
+  printf '%s\n' 'project_root=~/projects' 'agent=pi' 'pi_command=pi' 'claude_command=claude' 'codex_command=codex' 'agent_args=' 'pi_args=' 'claude_args=' 'codex_args=' '# claude-remote automatically adds --dangerously-skip-permissions; set claude_args for extra Claude switches.' > "$HOME/.config/pi-remote/config"
 fi
 if ! command -v node >/dev/null 2>&1; then
   printf '%s\n' 'pi-remote: Node.js is required on the remote host; no slow shell fallback is available' >&2
@@ -2293,7 +2382,7 @@ function writeLocalConfig(host: string): void {
     process.stdout.write(`config already exists: ${file}\n`);
     return;
   }
-  fs.writeFileSync(file, `host=${host}\nproject_root=~/projects\nagent=pi\npi_command=pi\nclaude_command=claude\ncodex_command=codex\n`);
+  fs.writeFileSync(file, `host=${host}\nproject_root=~/projects\nagent=pi\npi_command=pi\nclaude_command=claude\ncodex_command=codex\nagent_args=\npi_args=\nclaude_args=\ncodex_args=\n# claude-remote automatically adds --dangerously-skip-permissions; set claude_args for extra Claude switches.\n`);
   process.stdout.write(`wrote config: ${file}\n`);
 }
 
@@ -2302,7 +2391,7 @@ function firstUnexpectedPositional(args: string[]): string {
     const arg = args[index];
     if (arg === '--') return '';
     if (!arg.startsWith('-')) return arg;
-    if (['--host', '--project', '--new', '--sessions', '--saved-agent', '--saved-session-limit', '--session', '--agent', '--command', '--project-root', '--pi-bin'].includes(arg)) index += 1;
+    if (['--host', '--project', '--new', '--sessions', '--saved-agent', '--saved-session-limit', '--session', '--agent', '--command', '--agent-switch', '--agent-arg', '--project-root', '--pi-bin'].includes(arg)) index += 1;
   }
   return '';
 }
@@ -2425,8 +2514,22 @@ async function runLocal(args: string[]): Promise<void> {
   }
 }
 
+const CLAUDE_REMOTE_DEFAULT_SWITCH = '--dangerously-skip-permissions';
+
+function invocationName(): string {
+  return path.basename(process.env.PI_REMOTE_INVOKED_AS || process.argv[1] || '');
+}
+
+function argsForInvocation(args: string[]): string[] {
+  if (invocationName() !== 'claude-remote') return args;
+  const injected = ['--agent', 'claude'];
+  if (!args.includes(CLAUDE_REMOTE_DEFAULT_SWITCH)) injected.push('--agent-switch', CLAUDE_REMOTE_DEFAULT_SWITCH);
+  if (args[0] === '--server') return ['--server', ...injected, ...args.slice(1)];
+  return [...injected, ...args];
+}
+
 async function main(): Promise<void> {
-  const args = process.argv.slice(2);
+  const args = argsForInvocation(process.argv.slice(2));
   if (args[0] === '--server') await runServer(args);
   else await runLocal(args);
 }

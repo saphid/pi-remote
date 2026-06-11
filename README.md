@@ -4,12 +4,13 @@
 
 `pi-remote` is a small launcher for remote coding-agent sessions. It SSHes to a configured host, lets you pick or create a project under a remote project root, and starts or resumes a `tmux` session running your chosen agent CLI.
 
-It ships with two entry points:
+It ships with three entry points:
 
 - `pi-remote`: the TypeScript CLI, run with Node.js.
+- `claude-remote`: an alias for `pi-remote --agent claude` that also passes Claude `--dangerously-skip-permissions` by default.
 - `pi-remote.sh`: a compatibility wrapper that delegates to the same TypeScript CLI.
 
-There is no slower shell-menu fallback. Both entry points use local OpenSSH plus remote Bash, remote `tmux`, and whichever agent command you want to run (`pi`, `claude`, `codex`, or a custom command).
+There is no slower shell-menu fallback. These entry points use local OpenSSH plus remote Bash, remote `tmux`, and whichever agent command you want to run (`pi`, `claude`, `codex`, or a custom command).
 
 ## Install
 
@@ -39,7 +40,7 @@ Install or update the helper copy on the remote host:
 pi-remote --install-remote
 ```
 
-The remote helper is installed at `~/projects/pi-remote/pi-remote` and linked to `~/.local/bin/pi-remote`. A `pi-remote.sh` compatibility wrapper is installed too. The remote host must have Node.js; there is no slower shell-menu fallback.
+The remote helper is installed at `~/projects/pi-remote/pi-remote` and linked to `~/.local/bin/pi-remote` and `~/.local/bin/claude-remote`. A `pi-remote.sh` compatibility wrapper is installed too. The remote host must have Node.js; there is no slower shell-menu fallback.
 
 ## Usage
 
@@ -49,8 +50,10 @@ pi-remote.sh
 pi-remote --project my-project
 pi-remote --new my-project
 pi-remote --agent claude --project my-project
+claude-remote --project my-project
 pi-remote --agent codex --project my-project
 pi-remote --project my-project --session review-agent --no-attach -- "Review this project"
+pi-remote --agent claude --project my-project --agent-switch --dangerously-skip-permissions
 pi-remote --configure-tmux
 pi-remote --update
 pi-remote --saved-sessions
@@ -66,7 +69,7 @@ With no switches, `pi-remote` opens an interactive project menu. Active `tmux` s
 
 `--saved-sessions` opens the same KittyLitter-style picker over persisted Pi/Codex sessions (`~/.pi/agent/sessions` and `~/.codex/sessions`) on the target host without showing projects. Selecting a saved session starts a deterministic tmux session such as `pi-remote-pi-019e...` and re-attaches that tmux session on later launches instead of starting a second agent process for the same saved session. `--kittylitter` is an alias. Archived saved sessions, including Pi team-up/subagent JSONL sessions, are hidden by default; use `--include-archived` or `--archived` to review them later.
 
-Use `--no-attach` from non-interactive automation. It starts the `tmux` session detached and prints an attach command. The same options are available through `pi-remote` and `pi-remote.sh`.
+Use `--no-attach` from non-interactive automation. It starts the `tmux` session detached and prints an attach command. The same options are available through `pi-remote`, `claude-remote`, and `pi-remote.sh`.
 
 Interactive attach/start modes emit a sanitized terminal title (OSC 0) before handing the TTY to `tmux`, so terminals such as CMUX can label the tab with the selected project/session instead of the generic `PI Remote` launcher name. Non-interactive modes such as `--dry-run`, `--no-attach`, `--list`, and `--sessions` do not emit title escape sequences.
 
@@ -89,10 +92,15 @@ agent=pi
 pi_command=pi
 claude_command=claude
 codex_command=codex
+# Default switches/args inserted before anything passed after --.
+agent_args=
+pi_args=
+claude_args=
+codex_args=
 # launch_command=pi --some-default-flag
 ```
 
-`launch_command` or `--command` overrides the agent command lookup.
+`launch_command` or `--command` overrides the agent command lookup. Use `agent_args` for switches shared by every agent, or `<agent>_args` / `<agent>_switches` (for example `claude_args=--model sonnet`) for per-agent defaults. `--agent-switch VALUE` is the CLI equivalent and may be repeated. The `claude-remote` alias injects `--agent claude` and a default `--dangerously-skip-permissions` switch; use plain `pi-remote --agent claude` if you do not want that alias default.
 
 Useful environment variables:
 
@@ -102,6 +110,10 @@ PI_REMOTE_CONFIG           Local config path.
 PI_REMOTE_PROJECT_ROOT     Remote project root for server mode.
 PI_REMOTE_AGENT            Default agent for server mode.
 PI_REMOTE_LAUNCH_COMMAND   Custom launch command for server mode.
+PI_REMOTE_AGENT_ARGS       Default switches/args passed to every agent.
+PI_REMOTE_PI_ARGS          Default switches/args passed to Pi.
+PI_REMOTE_CLAUDE_ARGS      Default switches/args passed to Claude.
+PI_REMOTE_CODEX_ARGS       Default switches/args passed to Codex.
 PI_REMOTE_PI_BIN           Pi executable for server mode.
 PI_REMOTE_CLAUDE_BIN       Claude executable for server mode.
 PI_REMOTE_CODEX_BIN        Codex executable for server mode.

@@ -2,6 +2,8 @@
 set -eu
 PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 export PATH
+PI_REMOTE_INVOKED_AS=${PI_REMOTE_INVOKED_AS:-$(basename -- "$0")}
+export PI_REMOTE_INVOKED_AS
 SOURCE=$0
 while [ -L "$SOURCE" ]; do
   DIR=$(CDPATH='' cd -P -- "$(dirname -- "$SOURCE")" && pwd)
